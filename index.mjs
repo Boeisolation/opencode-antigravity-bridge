@@ -759,7 +759,7 @@ export function streamErrorOf(error) {
     type,
     message: String(error?.message ?? error),
     // Declare status explicitly so clients do not classify quoted upstream text (e.g. "code 429") as 429.
-    ...(type === "invalid_request_error" ? { status: 400 } : {}),
+    ...(type === "invalid_request_error" ? { status: 400 } : type === "permission_error" ? { status: 403 } : {}),
     ...(error?.code ? { code: error.code } : {}),
     ...(typeof error?.retryable === "boolean" ? { retryable: error.retryable } : {}),
     ...(Number.isSafeInteger(error?.retryAfterMs) ? { retry_after_ms: error.retryAfterMs } : {}),
@@ -770,9 +770,9 @@ class AgentTurnError extends Error {
   constructor(message, kind = "api_error", classification = null) {
     super(message)
     this.kind = kind
-    // An expired OAuth token stays expired inside this agy process: it does
-    // not refresh mid-session, so the process is dropped instead of reused.
-    this.keepProcess = classification?.category !== "unauthenticated"
+    // An expired or suspended OAuth session stays unusable inside this agy process,
+    // so drop the process instead of keeping it pooled.
+    this.keepProcess = classification?.category !== "unauthenticated" && classification?.category !== "forbidden"
     if (classification) {
       this.code = classification.category === "unauthenticated"
         ? "upstream_unauthenticated"
@@ -1366,6 +1366,7 @@ class Proc {
     this.resumeFrom = opts.resume || null
     this.validateReplay = opts.validateReplay
     this.compaction = opts.compaction === true
+    this.ephemeral = opts.ephemeral === true
     this.replayReason = opts.replayReason || "no_matching_session"
     this.token = randomUUID()
     this.sessionId = null
@@ -1865,7 +1866,7 @@ class Proc {
     while (split > 0 && history[split - 1].role === "assistant") split--
     let expectedSplit = this.expectedMessages.length
     while (expectedSplit > 0 && this.expectedMessages[expectedSplit - 1].role === "assistant") expectedSplit--
-    if (historyKey(this.expectedMessages.slice(0, expectedSplit)) !== historyKey(history.slice(0, split))) return false
+    if (!sameMessageHistory(this.expectedMessages.slice(0, expectedSplit), history.slice(0, split))) return false
     const actualAssistant = history.slice(split)
     const expectedAssistant = this.expectedMessages.slice(expectedSplit)
     const actualCalls = lastAssistantCalls(actualAssistant)
@@ -2583,8 +2584,10 @@ class Proc {
     }
     if (this.turn === turn) {
       this.turn = null
-      if (this.compaction) {
+      if (this.compaction || this.ephemeral) {
+        this.retiring = true
         dropFromPool(this)
+        unpark(this.convKey)
         this.stop().catch(() => {})
       } else if (!this.stopping && !this.retiring) park(this)
     }
@@ -2620,7 +2623,7 @@ class Proc {
   }
 
   canPark() {
-    return !!this.sessionId && this.hasSentFirstTurn && !this.historyInvalid && !this.turn &&
+    return !this.compaction && !this.ephemeral && !!this.sessionId && this.hasSentFirstTurn && !this.historyInvalid && !this.turn &&
       !this.dead && !this.steering && !this.continuingCancel && Array.isArray(this.expectedMessages)
   }
 
@@ -3112,7 +3115,7 @@ async function withAcquireLock(key, fn) {
 }
 
 function findFlattenedProc(opts) {
-  const candidates = [...pool.values()].filter(proc => !proc.dead && !proc.retiring && !proc.turn && !proc.steering && !proc.continuingCancel && proc.hasSentFirstTurn &&
+  const candidates = [...pool.values()].filter(proc => !proc.dead && !proc.retiring && !proc.turn && !proc.steering && !proc.continuingCancel && !proc.compaction && !proc.ephemeral && proc.hasSentFirstTurn &&
     (proc.account || null) === (opts.account || null) && proc.agyPath === findAgy() && proc.userId === (opts.userId || "") &&
     proc.workDir === opts.workDir && proc.model === opts.model && proc.toolsSignature === JSON.stringify(opts.tools) &&
     sameInstructions(proc.instructions, opts.instructions) && isContinuedOpening(proc, opts.messages?.[0]))
@@ -3573,11 +3576,54 @@ function sameToolUseIdentities(left, right) {
   return a != null && a === b
 }
 
+const MAGPIE_PLACEHOLDER_TOKEN_RE = /\{\{[A-Z][A-Z0-9_]*_[a-z2-7]{8}\}\}/g
+
+function matchesMagpieMaskedText(unmasked, masked) {
+  if (unmasked === masked) return true
+  if (typeof unmasked !== "string" || typeof masked !== "string") return false
+  const parts = masked.split(MAGPIE_PLACEHOLDER_TOKEN_RE)
+  if (parts.length < 2) return false
+  const tail = parts[parts.length - 1]
+  if (!unmasked.startsWith(parts[0]) || !unmasked.endsWith(tail)) return false
+  const endBound = unmasked.length - tail.length
+  let pos = parts[0].length
+  if (pos + (parts.length - 1) > endBound) return false
+  for (let i = 1; i < parts.length - 1; i++) {
+    const idx = unmasked.indexOf(parts[i], pos + 1)
+    if (idx < 0) return false
+    pos = idx + parts[i].length
+  }
+  return pos + 1 <= endBound
+}
+
+function sameHistoryModuloMagpieMasking(expected, actual) {
+  const left = historyRows(expected)
+  const right = historyRows(actual)
+  if (left.length !== right.length) return false
+  for (let i = 0; i < left.length; i++) {
+    if (left[i].role !== right[i].role || left[i].content.length !== right[i].content.length) return false
+    const assistant = left[i].role === "assistant"
+    for (let j = 0; j < left[i].content.length; j++) {
+      const a = left[i].content[j]
+      const b = right[i].content[j]
+      if (assistant && a?.type === "text" && b?.type === "text") {
+        if (!matchesMagpieMaskedText(a.text, b.text)) return false
+      } else if (stableJSON(a) !== stableJSON(b)) {
+        return false
+      }
+    }
+  }
+  return true
+}
+
 function sameMessageHistory(expected, actual) {
   if (!Array.isArray(expected) || !Array.isArray(actual)) return false
   if (historyKey(expected) === historyKey(actual)) return true
-  return sameToolUseIdentities(expected, actual) &&
-    historyKey(stripToolUseInputs(expected)) === historyKey(stripToolUseInputs(actual))
+  if (sameHistoryModuloMagpieMasking(expected, actual)) return true
+  if (!sameToolUseIdentities(expected, actual)) return false
+  const left = stripToolUseInputs(expected)
+  const right = stripToolUseInputs(actual)
+  return historyKey(left) === historyKey(right) || sameHistoryModuloMagpieMasking(left, right)
 }
 
 
@@ -3881,7 +3927,7 @@ function isContinuedOpening(proc, firstMessage) {
 }
 
 
-function historyKey(messages) {
+function historyRows(messages) {
   const rows = []
   const ids = new Map()
   for (const message of messages) {
@@ -3931,7 +3977,11 @@ function historyKey(messages) {
   for (const row of rows) {
     row.content = row.content.filter(block => block.type !== "text" || (block.text = block.text.trim()) !== "")
   }
-  return stableJSON(rows.filter(row => row.content.length))
+  return rows.filter(row => row.content.length)
+}
+
+function historyKey(messages) {
+  return stableJSON(historyRows(messages))
 }
 
 const prefillTailEnabled = () => process.env.AGY_BRIDGE_PREFILL !== "0"
@@ -5500,7 +5550,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
       const abort = () => {
         if (finished) return
         detach()
-        if (!proc.cancelTurn(turn, partial(), true)) {
+        if (proc.ephemeral || !proc.cancelTurn(turn, partial(), true)) {
           dropFromPool(proc)
           proc.abandonTurn(turn)
           proc.stop().catch(() => {})
@@ -5830,6 +5880,23 @@ async function beginTurn(proc, history, body, callerWorkDir, model, selection, p
     throw new UnsupportedContent("image input with this agy ACP server; update to an image-capable agy version")
   }
   return proc.startTurn(contentParts, body.messages, model, selection, promptAttempt, promptGuardMatched, [], cancelContinuation)
+}
+
+function isEphemeralSidePrompt(trailing, resultBlocks) {
+  if (resultBlocks.length || !trailing?.history?.length) return false
+  const last = trailing.messages?.at(-1)
+  if (last?.role !== "user") return false
+  const blocks = typeof last.content === "string" ? [{ type: "text", text: last.content }]
+    : Array.isArray(last.content) ? last.content : []
+  let text = ""
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const block = blocks[i]
+    if (typeof block !== "string" && block?.type !== "text") return false
+    const cleaned = replaceClosedSystemReminders(typeof block === "string" ? block : block.text || "", () => "").trim()
+    if (cleaned) { text = cleaned; break }
+  }
+  return text.startsWith("[SUGGESTION MODE:") ||
+    (text.startsWith("Describe your ") && text.includes(" in 3-5 words"))
 }
 
 // Native Magpie sign-in forms (auth.methods[].prompts + authorize(inputs)) that
@@ -6163,6 +6230,29 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                   for (const prompt of prepared) validateAcpPromptBudget(prompt, "", body)
                   const turn = proc.startTurn(prepared[0], body.messages, model, selection, promptAttempt,
                     promptGuardMatched, prepared.slice(1))
+                  return streamResponse(proc, turn, body, init.signal)
+                } catch (error) {
+                  dropFromPool(proc)
+                  await proc.stop().catch(() => {})
+                  throw error
+                }
+              }
+              if (isEphemeralSidePrompt(trailing, resultBlocks)) {
+                validateAcpPromptBudget(
+                  renderReplayPromptParts(body, callerWorkDir, systemAppend() && !!instructions, instructions),
+                  systemAppend() ? instructions : "", body,
+                )
+                const key = `${convKey}:ephemeral:${randomUUID()}`
+                promptAttempt = claimPromptAttempt(promptAttemptKey(key, body, trailing, model, selection, [], instructions))
+                const { proc } = await acquireProc(agy, key, {
+                  model, selection, tools: [], workDir, instructions,
+                  history: [], messages: body.messages, ephemeral: true,
+                  account: account.name, accountKey: account.key, geminiDir: account.dir,
+                  userId: body.metadata?.user_id || "",
+                }, true, true)
+                try {
+                  if (init.signal?.aborted) throw init.signal.reason || new Error("request aborted before prompt submission")
+                  const turn = await beginTurn(proc, [], body, callerWorkDir, model, selection, promptAttempt, promptGuardMatched)
                   return streamResponse(proc, turn, body, init.signal)
                 } catch (error) {
                   dropFromPool(proc)

@@ -215,3 +215,37 @@ test("agy 1.5.9 RESOURCE_EXHAUSTED banner and attempt-1 refused 429 capture refu
   assert.equal(recovered.failureCandidate, false)
   assert.equal(recovered.text, "Recovered.")
 })
+
+test("disabled account ToS notice and gRPC status banners are suppressed and recorded", () => {
+  const disabled = "⚠ This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product."
+  for (const suffix of ["", "\n", "\r\n"]) {
+    for (const chunks of [[`\n${disabled}${suffix}`], split(`\n${disabled}${suffix}`)]) {
+      const f = new AgentNoticeFilter()
+      let output = ""
+      for (const c of chunks) output += f.push(c)
+      output += f.flush({ holdTerminal: true })
+      assert.equal(output.trim(), "")
+      assert.equal(f.failureCandidate, true)
+      assert.equal(f.terminalDetail, disabled)
+    }
+  }
+  assert.equal(run([`Quoted: ${disabled}\n`]).text, `Quoted: ${disabled}\n`)
+  assert.equal(run([`\`\`\`\n${disabled}\n\`\`\`\n`]).text, `\`\`\`\n${disabled}\n\`\`\`\n`)
+
+  for (const banner of [
+    "⚠ PERMISSION_DENIED (code 403): access denied.",
+    "⚠ RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).",
+  ]) {
+    for (const suffix of ["", "\n"]) {
+      for (const chunks of [[banner + suffix], split(banner + suffix)]) {
+        const f = new AgentNoticeFilter()
+        let output = ""
+        for (const c of chunks) output += f.push(c)
+        output += f.flush({ holdTerminal: true })
+        assert.equal(output.trim(), "")
+        assert.equal(f.failureCandidate, true)
+        assert.equal(f.apiDetail, banner)
+      }
+    }
+  }
+})

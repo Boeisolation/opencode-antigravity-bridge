@@ -338,10 +338,12 @@ test("responseUsage does not fabricate 1 token on empty output or zero estimate"
   }
 })
 
-test("streamErrorOf marks invalid_request_error with status 400 and preserves metadata", async () => {
+test("streamErrorOf marks invalid_request_error with status 400, permission_error with status 403, and preserves metadata", async () => {
   const { streamErrorOf } = await import(`./index.mjs?fixes-err=${Date.now()}`)
   const invalid = streamErrorOf({ kind: "invalid_request_error", message: "code 429 turned away", code: "bad_prompt", retryable: false })
   assert.deepEqual(invalid, { type: "invalid_request_error", message: "code 429 turned away", status: 400, code: "bad_prompt", retryable: false })
+  const forbidden = streamErrorOf({ kind: "permission_error", message: "disabled in this account", code: "AGY_ERROR_FORBIDDEN", retryable: false })
+  assert.deepEqual(forbidden, { type: "permission_error", message: "disabled in this account", status: 403, code: "AGY_ERROR_FORBIDDEN", retryable: false })
   const quota = streamErrorOf({ kind: "rate_limit_error", message: "quota", code: "rate_limit", retryable: true, retryAfterMs: 3000 })
   assert.equal(quota.status, undefined)
   assert.equal(quota.retry_after_ms, 3000)
@@ -655,6 +657,274 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
     assert.equal(events.filter(e => e.type === "session/cancel").length, 1)
     assert.equal(events.filter(e => e.type === "session/prompt").length, 6)
     assert.ok(events.some(e => e.type === "unseen_bash_reply" && (e.r?.result?.isError === true || !!e.r?.error)), JSON.stringify(events))
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
+
+test("disabled account ToS notice never leaks as assistant text and emits 403 permission_error in stream and JSON", async () => {
+  const convDir = path.join(root, "conv-disabled")
+  const accountsDir = path.join(root, "accounts-disabled")
+  const stateFile = path.join(root, "state-disabled.json")
+  const fakeDir = path.join(root, "fake-disabled-agy")
+  fs.mkdirSync(convDir, { recursive: true })
+  fs.mkdirSync(accountsDir, { recursive: true })
+  let count = 0
+  const fakeBin = writeFakeAgy(fakeDir, `
+import readline from "node:readline";
+const args = process.argv.slice(2);
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
+let count = 0;
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+readline.createInterface({ input: process.stdin }).on("line", line => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } }, agentInfo: { name: "fake-agy", version: "1.5.9" } } });
+  } else if (msg.method === "session/new") {
+    count++;
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-dis-" + count } });
+  } else if (msg.method === "session/set_model" || msg.method === "session/set_config_option") {
+    send({ jsonrpc: "2.0", id: msg.id, result: {} });
+  } else if (msg.method === "session/prompt") {
+    const sid = msg.params?.sessionId;
+    send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: sid,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "\\n⚠ This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product.\\n" },
+        },
+      },
+    });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  }
+});
+`)
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = convDir
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  try {
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-disabled=${Date.now()}`)
+    const plugin = await AntigravityBridgePlugin()
+    const loader = await plugin.auth.loader()
+
+    const sseRes = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: true,
+        metadata: { user_id: `u-disabled-${++count}` },
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    })
+    assert.equal(sseRes.status, 200)
+    const sseText = await sseRes.text()
+    assert.ok(!sseText.includes("content_block_delta"), sseText)
+    assert.ok(sseText.includes("event: error"), sseText)
+    const errorData = sseText.split("\n\n").find(f => f.startsWith("event: error"))?.split("\n").find(l => l.startsWith("data:"))?.slice(5).trim()
+    const parsedErr = JSON.parse(errorData || "{}")
+    assert.equal(parsedErr.error?.type, "permission_error")
+    assert.equal(parsedErr.error?.status, 403)
+    assert.equal(parsedErr.error?.code, "AGY_ERROR_FORBIDDEN")
+
+    const jsonRes = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        metadata: { user_id: `u-disabled-${++count}` },
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    })
+    const jsonBody = await jsonRes.json()
+    assert.equal(jsonRes.status, 403, JSON.stringify(jsonBody))
+    assert.equal(jsonBody.error?.type, "permission_error")
+    assert.equal(jsonBody.error?.status, 403)
+    assert.equal(jsonBody.error?.code, "AGY_ERROR_FORBIDDEN")
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
+
+test("[SUGGESTION MODE] side-calls and Magpie PII placeholders preserve the warm ACP session", async () => {
+  const convDir = path.join(root, "conv-warm")
+  const accountsDir = path.join(root, "accounts-warm")
+  const stateFile = path.join(root, "state-warm.json")
+  const fakeDir = path.join(root, "fake-warm-agy")
+  const logFile = path.join(root, "warm.jsonl")
+  fs.mkdirSync(convDir, { recursive: true })
+  fs.mkdirSync(accountsDir, { recursive: true })
+  const fakeBin = writeFakeAgy(fakeDir, `
+import fs from "node:fs";
+import net from "node:net";
+import readline from "node:readline";
+const args = process.argv.slice(2);
+const logFile = process.env.FAKE_WARM_LOG;
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
+const pidTag = process.pid;
+let turnCount = 0;
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+function listTools() {
+  return new Promise((resolve, reject) => {
+    const port = Number(process.env.AGY_BRIDGE_CONTROL_PORT);
+    const token = process.env.AGY_BRIDGE_TOKEN;
+    const sock = net.createConnection({ host: "127.0.0.1", port }, () => {
+      sock.write(JSON.stringify({ token, kind: "list" }) + "\\n");
+    });
+    let buf = "";
+    sock.on("data", chunk => {
+      buf += chunk.toString("utf8");
+      const nl = buf.indexOf("\\n");
+      if (nl < 0) return;
+      resolve(JSON.parse(buf.slice(0, nl)));
+      sock.destroy();
+    });
+    sock.on("error", reject);
+  });
+}
+readline.createInterface({ input: process.stdin }).on("line", async line => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } }, agentInfo: { name: "fake-agy", version: "1.5.9" } } });
+  } else if (msg.method === "session/new") {
+    const listed = await listTools();
+    const sid = "s-warm-" + pidTag;
+    fs.appendFileSync(logFile, JSON.stringify({ event: "session/new", pid: pidTag, sid, tools: (listed.result?.tools || []).map(t => t.name) }) + "\\n");
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: sid } });
+  } else if (msg.method === "session/set_model" || msg.method === "session/set_config_option") {
+    send({ jsonrpc: "2.0", id: msg.id, result: {} });
+  } else if (msg.method === "session/prompt") {
+    turnCount++;
+    const sid = msg.params?.sessionId;
+    const text = (msg.params?.prompt || []).map(p => p.text || "").join("\\n");
+    fs.appendFileSync(logFile, JSON.stringify({ event: "session/prompt", pid: pidTag, sid, turnCount, text }) + "\\n");
+    const reply = text.includes("[SUGGESTION MODE:")
+      ? "继续测试"
+      : text.includes("部署免检定位验证")
+        ? "已部署"
+        : "当前基站位于四川省成都市金牛区顺庆巷66号院（大升桥附近），偏离2.4公里。";
+    send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: reply } } } });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  }
+});
+`)
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+    FAKE_WARM_LOG: process.env.FAKE_WARM_LOG,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = convDir
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  process.env.FAKE_WARM_LOG = logFile
+  const tools = [{ name: "bash", input_schema: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] } }]
+  try {
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-warm=${Date.now()}`)
+    const plugin = await AntigravityBridgePlugin()
+    const loader = await plugin.auth.loader()
+
+    const r1 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        system: "Main system prompt.",
+        metadata: { user_id: "u-warm-1" },
+        tools,
+        messages: [{ role: "user", content: "定位为什么偏了" }],
+      }),
+    })
+    const b1 = await r1.json()
+    assert.equal(r1.status, 200, JSON.stringify(b1))
+
+    const maskedAssistant = "当前基站位于{{ADDRESS_4fy4fj7x}}），偏离2.4公里。"
+    const rSuggest = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        system: "Main system prompt.",
+        metadata: { user_id: "u-warm-1" },
+        tools,
+        messages: [
+          { role: "user", content: "定位为什么偏了" },
+          { role: "assistant", content: [{ type: "text", text: maskedAssistant }] },
+          { role: "user", content: "[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]\n\nReply with ONLY the suggestion." },
+        ],
+      }),
+    })
+    const bSuggest = await rSuggest.json()
+    assert.equal(rSuggest.status, 200, JSON.stringify(bSuggest))
+    assert.equal(bSuggest.content.find(b => b.type === "text")?.text, "继续测试")
+
+    const r2 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        system: "Main system prompt.",
+        metadata: { user_id: "u-warm-1" },
+        tools,
+        messages: [
+          { role: "user", content: "定位为什么偏了" },
+          { role: "assistant", content: [{ type: "text", text: maskedAssistant }] },
+          { role: "user", content: "部署免检定位验证" },
+        ],
+      }),
+    })
+    const b2 = await r2.json()
+    assert.equal(r2.status, 200, JSON.stringify(b2))
+    assert.equal(b2.content.find(b => b.type === "text")?.text, "已部署")
+
+    const rEdited = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        system: "Main system prompt.",
+        metadata: { user_id: "u-warm-1" },
+        tools,
+        messages: [
+          { role: "user", content: "定位为什么偏了" },
+          { role: "assistant", content: [{ type: "text", text: "偏离5公里。" }] },
+          { role: "user", content: "再测一次" },
+        ],
+      }),
+    })
+    assert.equal(rEdited.status, 200)
+
+    const logEvents = fs.readFileSync(logFile, "utf8").trim().split("\n").map(JSON.parse)
+    const news = logEvents.filter(e => e.event === "session/new")
+    assert.equal(news.length, 3, JSON.stringify(news))
+    assert.deepEqual(news[0].tools, ["bash"])
+    assert.deepEqual(news[1].tools, [])
+    const mainPrompts = logEvents.filter(e => e.event === "session/prompt" && e.pid === news[0].pid)
+    assert.equal(mainPrompts.length, 2, JSON.stringify(mainPrompts))
+    assert.equal(mainPrompts[1].text.trim(), "部署免检定位验证")
   } finally {
     for (const [k, v] of Object.entries(prev)) {
       if (v === undefined) delete process.env[k]

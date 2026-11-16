@@ -276,3 +276,12 @@ test("UNAUTHENTICATED / HTTP 401 is classified separately from 403 and never ret
 test("depleted AI credits are classified as exhausted quota", () => {
   assert.equal(classifyUpstreamError("⚠ Your AI credits balance is too low to continue.").category, "quota_exhausted")
 })
+
+test("disabled account Terms of Service notice is classified as forbidden", () => {
+  const actual = classifyUpstreamError(
+    "⚠ This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product.",
+  )
+  assert.equal(actual.category, "forbidden")
+  assert.equal(actual.retryable, false)
+  assert.equal(actual.reasonCode, "AGY_ERROR_FORBIDDEN")
+})

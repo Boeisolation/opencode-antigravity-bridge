@@ -14,13 +14,21 @@
 const ERROR_LINE = "⚠ Agent execution terminated due to error."
 const NETWORK_LINE = "⚠ There was a network issue connecting to the server, please try again."
 const CREDITS_LINE = "⚠ Your AI credits balance is too low to continue."
+const DISABLED_LINE = "⚠ This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product."
 const INVALID_LINE = "⚠ Model produced invalid output."
-const TERMINAL_LINES = [NETWORK_LINE, CREDITS_LINE]
+const TERMINAL_LINES = [NETWORK_LINE, CREDITS_LINE, DISABLED_LINE]
 const INTERRUPT_LINE = "⚠ The stream was interrupted. Please continue the task you were working on."
 const API_HEAD = "⚠ API error (attempt "
 const API_FULL = /^⚠ API error \(attempt \d+\): /
-const EXHAUSTED_HEAD = "⚠ RESOURCE_EXHAUSTED (code "
-const EXHAUSTED_FULL = /^⚠ RESOURCE_EXHAUSTED \(code \d+\): /
+const STATUS_HEADS = [
+  "⚠ RESOURCE_EXHAUSTED (code ",
+  "⚠ PERMISSION_DENIED (code ",
+  "⚠ UNAUTHENTICATED (code ",
+  "⚠ INVALID_ARGUMENT (code ",
+  "⚠ FAILED_PRECONDITION (code ",
+]
+const STATUS_FULL = /^⚠ (?:RESOURCE_EXHAUSTED|PERMISSION_DENIED|UNAUTHENTICATED|INVALID_ARGUMENT|FAILED_PRECONDITION) \(code \d+\): /
+const isApiBanner = line => API_FULL.test(line) || STATUS_FULL.test(line)
 const API_PARTIAL = /^\d*(?:\)(?::(?: )?)?)?$/
 export const isRefused429 = (detail) =>
   /code 429\b/i.test(String(detail ?? "")) && /resource has been exhausted/i.test(String(detail ?? ""))
@@ -54,11 +62,11 @@ export class AgentNoticeFilter {
       (line.length <= value.length + 16 && line.trimEnd() === value))) return "hold"
     if (line.startsWith("⚠") || "⚠".startsWith(line)) {
       if (complete ? [INTERRUPT_LINE, INVALID_LINE].includes(line.trimEnd()) : false) return "notice"
-      if (API_FULL.test(line) || EXHAUSTED_FULL.test(line)) return "api"
+      if (isApiBanner(line)) return "api"
       if (!complete) {
-        if (ERROR_LINE.startsWith(line) || INTERRUPT_LINE.startsWith(line) || INVALID_LINE.startsWith(line) || API_HEAD.startsWith(line) || EXHAUSTED_HEAD.startsWith(line)) return "hold"
+        if (ERROR_LINE.startsWith(line) || INTERRUPT_LINE.startsWith(line) || INVALID_LINE.startsWith(line) || API_HEAD.startsWith(line) || STATUS_HEADS.some(head => head.startsWith(line))) return "hold"
         if (line.startsWith(API_HEAD) && line.length <= API_HEAD.length + 16 && API_PARTIAL.test(line.slice(API_HEAD.length))) return "hold"
-        if (line.startsWith(EXHAUSTED_HEAD) && line.length <= EXHAUSTED_HEAD.length + 16 && API_PARTIAL.test(line.slice(EXHAUSTED_HEAD.length))) return "hold"
+        if (STATUS_HEADS.some(head => line.startsWith(head) && line.length <= head.length + 16 && API_PARTIAL.test(line.slice(head.length)))) return "hold"
         if (line.length <= INTERRUPT_LINE.length + 16 && (line.trimEnd() === ERROR_LINE || line.trimEnd() === INTERRUPT_LINE || line.trimEnd() === INVALID_LINE)) return "hold"
       }
     } else if (!complete && /^ {0,3}(?:`{1,2}|~{1,2})$/.test(line)) return "hold"
@@ -156,8 +164,14 @@ export class AgentNoticeFilter {
     if (line.trimEnd() === ERROR_LINE) { this.failureCandidate = true; this.terminal += rest; return holdTerminal ? "" : this.flush() }
     if (!this.fence) {
       if (TERMINAL_LINES.includes(line.trimEnd())) { this.failureCandidate = true; this.terminalDetail = line.trimEnd(); this.dropped++; return "" }
-      if (API_FULL.test(line)) this.apiDetail = line.slice(0, 2000)
-      if ([INTERRUPT_LINE, INVALID_LINE].includes(line.trimEnd()) || API_FULL.test(line)) { this.dropped++; this.failureCandidate = true; return "" }
+      if (isApiBanner(line)) {
+        this.apiDetail = line.slice(0, 2000)
+        if (isRefused429(this.apiDetail)) this.refusedDetail = this.apiDetail
+        this.dropped++
+        this.failureCandidate = true
+        return ""
+      }
+      if ([INTERRUPT_LINE, INVALID_LINE].includes(line.trimEnd())) { this.dropped++; this.failureCandidate = true; return "" }
     }
     this.midLine = !rest.endsWith("\n")
     if (rest.trim()) this.#recovered()
