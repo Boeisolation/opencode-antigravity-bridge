@@ -932,3 +932,30 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
     }
   }
 })
+
+
+test("documents.mjs handles http(s) URLs, base64 UTF-8 text/JSON/XML, tool_result binary PDFs, and clear user refusals", async () => {
+  const { documentText, documentRefusal } = await import("./documents.mjs")
+  assert.equal(
+    documentText({ type: "document", title: "Spec", source: { type: "url", url: "https://example.invalid/spec" } }),
+    "[document: Spec at https://example.invalid/spec; its content is not attached here. Fetch the URL with a tool to read it.]",
+  )
+  assert.equal(
+    documentText({ type: "document", title: "cfg.json", source: { type: "base64", media_type: "application/json; charset=utf-8", data: Buffer.from('{"ok":true}').toString("base64") } }),
+    '[document: cfg.json]\n{"ok":true}\n[end of document]',
+  )
+  assert.equal(
+    documentText({ type: "document", title: "bad.txt", source: { type: "base64", media_type: "text/plain", data: Buffer.from([0xff, 0xfe]).toString("base64") } }),
+    null,
+  )
+  assert.equal(
+    documentText({ type: "document", title: "report.pdf", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0=" } }, { inToolResult: false }),
+    null,
+  )
+  assert.equal(
+    documentText({ type: "document", title: "report.pdf", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0=" } }, { inToolResult: true }),
+    "[document: report.pdf: a PDF that could not be attached here. Extract its text with a tool (pdftotext, say) to read it.]",
+  )
+  assert.match(documentRefusal({ type: "document", source: { type: "file", file_id: "f_1" } }).what, /Files API file_id/)
+  assert.match(documentRefusal({ type: "document", source: { type: "url", url: "ftp://x/y" } }).what, /other than http\(s\)/)
+})

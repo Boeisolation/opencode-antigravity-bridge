@@ -30,6 +30,7 @@ import { AGY_MANUAL, installAgy, keepAgyCurrent } from "./install.mjs"
 import { COMPACTION_INSTRUCTIONS, compactionPrompts, openCodeCompactionStart } from "./compaction.mjs"
 import { fetchCloudCodeModels, getCachedCloudCodeModels, invalidateModelMetadataCache, isReasoningModel, resolveModelMetadata } from "./model-metadata.mjs"
 import { processExists } from "./proc.mjs"
+import { documentRefusal, documentText } from "./documents.mjs"
 
 const PACKAGE_METADATA = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"))
 export const MIN_AGY_VERSION = "1.4.12"
@@ -650,8 +651,8 @@ class ConflictError extends Error {
 }
 
 class UnsupportedContent extends Error {
-  constructor(what) {
-    super(`agy bridge: ${what} is not supported`)
+  constructor(what, hint = "") {
+    super(`agy bridge: ${what} is not supported${hint ? `. ${hint}` : ""}`)
     this.statusCode = 400
   }
 }
@@ -3468,24 +3469,14 @@ function parseUserImage(block) {
   return imageContent({ ...block, source: { ...block.source, media_type: mediaType === "image/jpg" ? "image/jpeg" : mediaType } })
 }
 
-function parseUserDocumentText(block) {
+function parseUserDocumentText(block, inToolResult = false) {
   if (block?.type !== "document") return ""
-  const title = typeof block.title === "string" && block.title.trim() ? block.title.trim() : ""
-  const src = block.source
-  let text = null
-  if (src?.type === "text" && typeof src.data === "string") {
-    text = src.data
-  } else if (src?.type === "content") {
-    if (typeof src.content === "string") {
-      text = src.content
-    } else if (Array.isArray(src.content) && src.content.every((part) => part?.type === "text" && typeof part.text === "string")) {
-      text = src.content.map((part) => part.text).join("\n")
-    }
-  }
+  const text = documentText(block, { inToolResult })
   if (text === null) {
-    throw new UnsupportedContent("a binary or URL document block in a user message (agy's ACP prompt accepts text and images only)")
+    const { what, hint } = documentRefusal(block)
+    throw new UnsupportedContent(what, hint)
   }
-  return title ? `[document: ${title}]\n${text}\n[end of document]` : text
+  return text
 }
 
 function parseSearchResultText(block) {
@@ -4318,7 +4309,7 @@ function normalizeTools(body) {
   return tools
 }
 
-function blockText(block) {
+function blockText(block, inToolResult = false) {
   if (typeof block === "string") return block
   if (!block || typeof block !== "object" || Array.isArray(block)) {
     throw new UnsupportedContent("a non-object content block")
@@ -4328,7 +4319,7 @@ function blockText(block) {
   if (block.type === "tool_reference" && typeof block.tool_name === "string") {
     return `Loaded tool: ${block.tool_name}`
   }
-  if (block.type === "document") return parseUserDocumentText(block)
+  if (block.type === "document") return parseUserDocumentText(block, inToolResult)
   if (block.type === "search_result") return parseSearchResultText(block)
   if (block.type === "image") {
     parseUserImage(block)
@@ -4338,7 +4329,7 @@ function blockText(block) {
     const inner = Array.isArray(block.content)
       ? block.content.map((part) => {
         if (part?.type === "image") return "[image returned by tool]"
-        return blockText(part)
+        return blockText(part, true)
       }).join("")
       : String(block.content ?? "")
     return `[tool result${block.tool_use_id ? " id=" + block.tool_use_id : ""}]\n${inner}\n[end of tool result]`
@@ -4349,7 +4340,7 @@ function blockText(block) {
 
 function messageText(message) {
   if (typeof message.content === "string") return message.content
-  if (Array.isArray(message.content)) return message.content.map(blockText).join("")
+  if (Array.isArray(message.content)) return message.content.map((part) => blockText(part)).join("")
   return String(message.content ?? "")
 }
 
@@ -4806,7 +4797,7 @@ function toolResult(block) {
       if (part?.type === "tool_reference" && typeof part.tool_name === "string") {
         return { type: "text", text: `Loaded tool: ${part.tool_name}` }
       }
-      if (part?.type === "document") return { type: "text", text: parseUserDocumentText(part) }
+      if (part?.type === "document") return { type: "text", text: parseUserDocumentText(part, true) }
       if (part?.type === "search_result") return { type: "text", text: parseSearchResultText(part) }
       if (part?.type === "image" && part.source?.type === "base64" && part.source.data) {
         return {
