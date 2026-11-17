@@ -1,4 +1,4 @@
-import { agyCandidates, spawnAgy, windowsMcpShim, wslAgyPath, wslDistro, wslMcpShim, wslPath } from "./platform.mjs"
+import { agyCandidates, spawnAgy, windowsMcpShim, windowsNcBuild, wslAgyPath, wslDistro, wslMcpShim, wslPath } from "./platform.mjs"
 import { spawn } from "node:child_process"
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import { once } from "node:events"
@@ -20,15 +20,17 @@ import { sanitizeSystemPrompt } from "./prompt-guard.mjs"
 import { classifyUpstreamError } from "./upstream-error.mjs"
 import { latestGenerationIdx, latestModelStep, modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
 import { OutputLimitFilter } from "./output-limit.mjs"
-import { AgentNoticeFilter, isRefused429 } from "./agent-notice.mjs"
+import { AgentNoticeFilter, isRefused429, VERIFY_LINE } from "./agent-notice.mjs"
 import { SummaryThoughtFilter } from "./thought-filter.mjs"
 import { sanitizeInputSchema, TOOL_SEARCH_INPUT_SCHEMA } from "./tool-schema.mjs"
 import { cloakUser, outgoing, hint, turnsAway } from "./cloak.mjs"
 import { fitTools } from "./tool-budget.mjs"
-import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, storedEmail, storedSignInNow } from "./signin.mjs"
+import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, readAccountSignIn, storedEmail, storedSignIn, storedSignInNow } from "./signin.mjs"
 import { AGY_MANUAL, installAgy, keepAgyCurrent } from "./install.mjs"
 import { COMPACTION_INSTRUCTIONS, compactionPrompts, openCodeCompactionStart } from "./compaction.mjs"
 import { fetchCloudCodeModels, getCachedCloudCodeModels, invalidateModelMetadataCache, isReasoningModel, resolveModelMetadata } from "./model-metadata.mjs"
+import { processExists } from "./proc.mjs"
+import { documentRefusal, documentText } from "./documents.mjs"
 
 const PACKAGE_METADATA = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"))
 export const MIN_AGY_VERSION = "1.4.12"
@@ -76,7 +78,13 @@ function detachedEvictMs() {
 const MAX_PARKED = 32
 const MAX_PROMPT_ATTEMPTS = 128
 const DEFAULT_PROC_START_TIMEOUT_MS = 60_000
-const systemAppend = () => /^(?:1|true|on|yes)$/i.test(process.env.AGY_BRIDGE_SYSTEM_APPEND || "")
+const AUTO_SYSTEM_APPEND_BYTES = 60_000
+function systemAppend(instructions = "") {
+  const raw = (process.env.AGY_BRIDGE_SYSTEM_APPEND || "").trim()
+  if (/^(?:0|false|off|no|disabled?)$/i.test(raw)) return false
+  if (/^(?:1|true|on|yes|enabled?)$/i.test(raw)) return true
+  return !!instructions && Buffer.byteLength(outgoingSystemText(instructions), "utf8") > AUTO_SYSTEM_APPEND_BYTES
+}
 const promptGuardEnabled = () => process.env.AGY_BRIDGE_PROMPT_GUARD !== "0"
 // Bound silence without meaningful agy output. agy emits nothing while it
 // generates tool-call arguments, so a large Write can be silent for minutes;
@@ -95,10 +103,11 @@ const CANCEL_SETTLE_MS = 15_000
 const STEER_WAIT_RETRY_MS = [50, 150, 400]
 const RECLAIM_STOP_TIMEOUT_MS = 10_000
 const SUPERSEDED_NOTE = "agy bridge: this tool call was superseded because the client conversation continued without it; stop this turn"
+const DROPPED_NOTE = "agy bridge: cancelled by the client, not executed; the conversation continues with the next message"
 const SELF_POLL_IDLE_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_SELF_POLL_IDLE_TIMEOUT_MS, 20 * 60 * 1000)
 const SELF_POLL_LIMIT = positiveTimeout(process.env.AGY_BRIDGE_SELF_POLL_LIMIT, 8)
 const SELF_POLL_NOTE = "agy bridge: gave up waiting for this tool: the client never returned a result for it; stop this turn"
-const TOOL_LIST_WAIT_MS = 5_000
+const TOOL_LIST_WAIT_MS = 20_000
 const STDERR_TAIL = 32 * 1024
 const CONTROL_LINE_LIMIT = 16 * 1024 * 1024
 const ACP_LINE_LIMIT = 64 * 1024 * 1024
@@ -141,10 +150,10 @@ const FILTER_SUMMARY_THOUGHTS = process.env.AGY_BRIDGE_KEEP_SUMMARY_THOUGHTS !==
 
 const ACP_CLIENT_INFO = Object.freeze({ name: PACKAGE_METADATA.name, version: PACKAGE_METADATA.version })
 const MODEL_CACHE_TTL_MS = 60_000
-// A cold `agy acp` handshake takes several seconds. Discovery waits this long
-// for the first confirmation, concurrently with `agy models` (15s cap).
+// A cold `agy acp` handshake or `agy models` call can take 27-39s on slow metadata calls.
+const LIST_MODELS_TIMEOUT_MS = 45_000
 const MODEL_PROBE_WAIT_MS = 10_000
-const MODEL_PROBE_STEP_MS = 5_000
+const MODEL_PROBE_STEP_MS = 15_000
 const MODEL_PROBE_RETRY_MS = 15_000
 
 const FALLBACK_MODELS = [
@@ -173,6 +182,7 @@ let cachedAgyPath
 let controlServer
 let controlServerPromise
 let shimDir
+let shimDirOwned = false
 let shimDirPromise
 
 function positiveTimeout(value, fallback) {
@@ -252,9 +262,10 @@ function execOnce(file, args, opts = {}) {
     let child
     try {
       const launch = file === "taskkill" ? spawn : spawnAgy
+      const { unrefTimer, ...spawnOpts } = opts
       child = launch(file, args, {
         stdio: ["ignore", "pipe", "pipe"],
-        ...opts,
+        ...spawnOpts,
         windowsHide: true,
       })
     } catch (err) {
@@ -268,6 +279,7 @@ function execOnce(file, args, opts = {}) {
       timedOut = true
       try { child.kill("SIGKILL") } catch {}
     }, opts.timeoutMs ?? 30_000)
+    if (opts.unrefTimer) timer.unref?.()
     child.stdout.on("data", (data) => { stdout += data })
     child.stderr.on("data", (data) => { stderr += data })
     child.on("error", (err) => {
@@ -281,6 +293,42 @@ function execOnce(file, args, opts = {}) {
   })
 }
 
+const helpProbeCache = new Map()
+function helpProbe(agyPath, cacheKey, args, unrefTimer = false) {
+  let key = `${wslDistro() || "native"}|${cacheKey}|${agyPath}`
+  try {
+    const st = fs.statSync(agyPath)
+    key += `\0${st.mtimeMs}\0${st.size}`
+  } catch {}
+  let probe = helpProbeCache.get(key)
+  if (!probe) {
+    probe = execOnce(agyPath, args, { timeoutMs: 10_000, unrefTimer }).then(({ err, stdout, stderr, timedOut }) => {
+      if (err || timedOut) helpProbeCache.delete(key)
+      return stdout + stderr
+    })
+    helpProbeCache.set(key, probe)
+  }
+  return probe
+}
+
+const MODELS_SETTINGS = JSON.stringify({ modelProvider: "" })
+
+async function modelsArgs(agyPath, extraArgs = []) {
+  const help = await helpProbe(agyPath, "top", ["--help"], true)
+  return /^\s*--settings\b/m.test(help) ? ["--settings", MODELS_SETTINGS, ...extraArgs, "models"] : [...extraArgs, "models"]
+}
+
+async function noDefaultCustomizationsArgs(agyPath) {
+  const help = await helpProbe(agyPath, "acp", ["acp", "--help"])
+  return /--include-default-customizations\b/.test(help) ? ["--include-default-customizations=false"] : []
+}
+
+async function telemetryArgs(agyPath, env = process.env) {
+  if (/^(?:1|true|on|yes|enabled)$/i.test(env.AGY_BRIDGE_TELEMETRY || "")) return []
+  const help = await helpProbe(agyPath, "acp", ["acp", "--help"])
+  return /--disable[-_]telemetry\b/.test(help) ? ["--disable-telemetry"] : []
+}
+
 // agy normally prefers the machine-global OS keyring, which every account
 // shares. Named accounts must read their own file token instead. WSL detection
 // is the CLI's file-storage switch, so pin it for account children; a real WSL
@@ -292,8 +340,8 @@ function accountEnv(env, geminiDir) {
 
 async function listAgyModels(agyPath, extraArgs = []) {
   const geminiDir = extraArgs.find(arg => arg.startsWith("--gemini_dir="))?.slice("--gemini_dir=".length)
-  const { err, stdout, stderr, code } = await execOnce(agyPath, [...extraArgs, "models"], {
-    timeoutMs: 15_000,
+  const { err, stdout, stderr, code } = await execOnce(agyPath, await modelsArgs(agyPath, extraArgs), {
+    timeoutMs: configuredTimeout("AGY_BRIDGE_MODELS_TIMEOUT_MS", LIST_MODELS_TIMEOUT_MS),
     env: accountEnv(process.env, geminiDir),
   })
   if (wslDistro() && (err || code !== 0 || !stdout.trim())) throw new Error(`WSL agy models failed: ${err?.message || stderr?.trim() || "empty model response"}. Check wsl.exe, the configured distro and AGY_PATH; run agy in that same distro to sign in.`)
@@ -386,7 +434,8 @@ async function runOfferedProbe(agyPath, account) {
   let workspace, child, conn
   try {
     workspace = await fs.promises.mkdtemp(path.join(os.tmpdir(), "agy-model-probe-"))
-    const args = ["acp", ...(account.dir ? [`--gemini_dir=${account.dir}`] : [])]
+    const args = ["acp", ...(account.dir ? [`--gemini_dir=${account.dir}`] : []),
+      ...await noDefaultCustomizationsArgs(agyPath), ...await telemetryArgs(agyPath)]
     child = spawnAgy(agyPath, args, { cwd: workspace, stdio: ["pipe", "pipe", "pipe"], windowsHide: true, detached: process.platform !== "win32",
       env: { ...accountEnv({ ...process.env }, account.dir), AGY_CLI_DISABLE_AUTO_UPDATE: "true" } })
     child.stderr?.resume()
@@ -394,9 +443,10 @@ async function runOfferedProbe(agyPath, account) {
     child.on("error", error => conn?.close(error))
     child.on("close", () => conn?.close(new Error("agy model probe exited")))
     conn = new AcpConnection(child, { onNotification: () => {}, onRequest: async () => { throw Object.assign(new Error("not supported"), { code: -32601 }) }, onProtocolError: error => conn.close(error) })
-    const init = await conn.request("initialize", { protocolVersion: 1, clientInfo: ACP_CLIENT_INFO, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } }, MODEL_PROBE_STEP_MS)
+    const stepTimeoutMs = configuredTimeout("AGY_BRIDGE_MODEL_PROBE_STEP_MS", MODEL_PROBE_STEP_MS)
+    const init = await conn.request("initialize", { protocolVersion: 1, clientInfo: ACP_CLIENT_INFO, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } }, stepTimeoutMs)
     if (agyTooOld(init?.agentInfo?.version)) return null
-    const session = await conn.request("session/new", { cwd: wslPath(workspace, wslDistro()), mcpServers: [] }, MODEL_PROBE_STEP_MS)
+    const session = await conn.request("session/new", { cwd: wslPath(workspace, wslDistro()), mcpServers: [] }, stepTimeoutMs)
     const canClose = init?.agentCapabilities?.sessionCapabilities?.close ?? init?.agentCapabilities?.session_capabilities?.close
     if (session?.sessionId && canClose) await conn.request("session/close", { sessionId: session.sessionId }, 1000).catch(() => {})
     const models = offeredModelsFromSession(session)
@@ -649,8 +699,8 @@ class ConflictError extends Error {
 }
 
 class UnsupportedContent extends Error {
-  constructor(what) {
-    super(`agy bridge: ${what} is not supported`)
+  constructor(what, hint = "") {
+    super(`agy bridge: ${what} is not supported${hint ? `. ${hint}` : ""}`)
     this.statusCode = 400
   }
 }
@@ -784,17 +834,87 @@ class AgentTurnError extends Error {
   }
 }
 
+const VERIFY_REFUSAL_RE = /please verify your account in your browser to continue|verification required\. please complete verification|verify your account to continue/i
+const VERIFY_ADVICE = "this Google account needs to be verified"
+
+// Local fallback until WP2's usage.mjs exports (verifyLinkIn, verifyRefused) are wired in.
+function verifyLinkIn(output) {
+  const said = String(output ?? "").replace(/\\u0026/g, "&").replace(/&amp;/g, "&")
+  const named = (key) => new RegExp(`"?${key}"?\\s*[:=]\\s*"?(https://[^\\s"'\\\\<>]+)`, "i").exec(said)?.[1]
+  const link = named("validation_?link") || named("validation_?url") ||
+    /in your browser to continue:\s*(https:\/\/[^\s"'\\<>]+)/i.exec(said)?.[1] ||
+    /(https:\/\/accounts\.google\.com\/[^\s"'\\<>]+)/i.exec(said)?.[1] || ""
+  const trimmed = link.replace(/[).,;\]}]+$/, "")
+  try {
+    const u = new URL(trimmed)
+    return u.protocol === "https:" && u.host ? trimmed : ""
+  } catch {
+    return ""
+  }
+}
+
+function verifyRefused(link) {
+  const said = "Google wants this account verified before Antigravity serves it again (agy: \"Verification Required\")"
+  return link
+    ? `${said} — ${VERIFY_ADVICE}: open ${link} in a browser signed in to it, verify it, then try again`
+    : `${said} — ${VERIFY_ADVICE}: open the Antigravity app, or run \`agy\` in a terminal, signed in to it and do what it asks, then try again`
+}
+
+function refusedError(why) {
+  const error = new AgentTurnError(`agy bridge: ${why}`, "permission_error", {
+    category: "forbidden",
+    retryable: false,
+    reasonCode: "AGY_ERROR_FORBIDDEN",
+    retryAfterMs: null,
+  })
+  error.statusCode = 403
+  return error
+}
+
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`
+}
+
+function toolsUnlistedError(count, timeoutMs = configuredTimeout("AGY_BRIDGE_TOOL_LIST_WAIT_MS", TOOL_LIST_WAIT_MS)) {
+  const windows = process.platform === "win32" && shimDirOwned
+  const why = windows
+    ? `nc.exe, the program agy runs to reach them, could not be built (${ncBuildFailure || "unknown reason"}), and agy doesn't run the nc.cmd used instead`
+    : `the MCP server agy starts through \`nc\` to reach them didn't answer within ${Math.round(timeoutMs / 1000)}s`
+  const error = new Error(`agy bridge: agy never loaded the request's ${count} tool${count === 1 ? "" : "s"}: ${why}. The model would have seen none of them`)
+  error.statusCode = 502
+  error.code = "tools_not_loaded"
+  return error
 }
 
 // agy connects to --ide-mcp-port by running `nc host port`. A private `nc`
 // earlier in agy's PATH runs the bridge's stdio MCP server instead, so the
 // connection is authenticated by the per-process token in its environment.
-function ensureShimDir() {
+async function ensureShimDir() {
   const distro = wslDistro()
+  if (!distro && shimDir && !shimDirOwned && !await isFileWithBytes(path.join(shimDir, "nc.exe"))) {
+    shimDir = undefined
+    shimDirPromise = null
+  }
+  if (shimDirPromise && !distro && process.platform === "win32" && ncBuildFailure && shimDirOwned &&
+    Date.now() - ncBuildFailedAt >= NC_BUILD_RETRY_MS) {
+    shimDirPromise = null
+  }
   if (shimDirPromise) return shimDirPromise
   shimDirPromise = (async () => {
+    if (!distro && process.platform === "win32") {
+      const shared = await windowsNcDir().catch((error) => {
+        ncBuildFailure = String(error?.message ?? error)
+        return null
+      })
+      if (shared) {
+        ncBuildFailure = ""
+        shimDir = shared
+        shimDirOwned = false
+        return shared
+      }
+      ncBuildFailedAt = Date.now()
+      if (shimDirOwned && shimDir) return shimDir
+    }
     const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "magpie-agy-bridge-bin-"))
     if (distro) {
       await fs.promises.writeFile(path.join(dir, "nc"),
@@ -808,10 +928,107 @@ function ensureShimDir() {
         `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(MCP_SERVER_PATH)}\n`, { mode: 0o700 })
     }
     shimDir = dir
+    shimDirOwned = true
     return dir
   })()
   shimDirPromise.catch(() => { shimDirPromise = null })
   return shimDirPromise
+}
+
+const WINDOWS_NC_PREFIX = "magpie-agy-bridge-nc-"
+const WINDOWS_NC_BUILD_PREFIX = "magpie-agy-bridge-ncbuild-"
+const WINDOWS_NC_BUILD_TIMEOUT_MS = 120_000
+const NC_BUILD_RETRY_MS = 5 * 60 * 1000
+let ncBuildFailure = ""
+let ncBuildFailedAt = 0
+const WINDOWS_NC_RUNTIME_FILE = "runtime"
+
+function asciiPath(value) {
+  return /^[\x20-\x7e]*$/.test(String(value || ""))
+}
+
+async function isFileWithBytes(file) {
+  try {
+    const stat = await fs.promises.stat(file)
+    return stat.isFile() && stat.size > 0
+  } catch {
+    return false
+  }
+}
+
+async function windowsNcDir() {
+  if (!windowsNcBuild(process.execPath, MCP_SERVER_PATH, "nc.exe")) {
+    ncBuildFailure = `${path.win32.basename(String(process.execPath || ""))} is not Bun, which builds it`
+    return null
+  }
+  const tmp = os.tmpdir()
+  const source = await fs.promises.readFile(MCP_SERVER_PATH)
+  const runtimeKey = createHash("sha256").update(String(process.execPath)).update("\0")
+    .update(String(process.versions?.bun || "")).digest("hex").slice(0, 16)
+  const key = createHash("sha256").update(String(process.execPath)).update("\0")
+    .update(String(process.versions?.bun || "")).update("\0").update(source).digest("hex").slice(0, 16)
+  const dir = path.join(tmp, WINDOWS_NC_PREFIX + key)
+  const exe = path.join(dir, "nc.exe")
+  if (await isFileWithBytes(exe)) {
+    const now = new Date()
+    await fs.promises.utimes(exe, now, now).catch(() => {})
+    return dir
+  }
+  const build = await fs.promises.mkdtemp(path.join(tmp, WINDOWS_NC_BUILD_PREFIX))
+  let copy = null
+  let copyBase = null
+  try {
+    let runtime = process.execPath
+    if (!asciiPath(runtime)) {
+      // Bun's compile reads its own path one byte to one UTF-16 unit, so a non-ASCII folder fails with ENOENT.
+      const base = [tmp, process.env.PUBLIC, process.env.ProgramData].find(dir => dir && asciiPath(dir))
+      if (!base) {
+        ncBuildFailure = "Bun is under a non-ASCII folder and there is no ASCII-only folder to copy it to"
+        return null
+      }
+      copyBase = base
+      copy = base === tmp ? build : await fs.promises.mkdtemp(path.join(base, WINDOWS_NC_BUILD_PREFIX))
+      runtime = path.join(copy, path.win32.basename(process.execPath))
+      await fs.promises.copyFile(process.execPath, runtime)
+    }
+    const spec = windowsNcBuild(runtime, MCP_SERVER_PATH, path.join(build, "nc.exe"))
+    const { err, code, timedOut, stdout, stderr } = await execOnce(spec.file, spec.args, { cwd: build, timeoutMs: WINDOWS_NC_BUILD_TIMEOUT_MS })
+    if (err || timedOut || code !== 0 || !await isFileWithBytes(path.join(build, "nc.exe"))) {
+      const said = String(stderr || stdout || err?.message || "").trim().split(/\r?\n/).filter(Boolean).slice(-2).join(" ")
+      ncBuildFailure = `bun build ${timedOut ? `timed out after ${WINDOWS_NC_BUILD_TIMEOUT_MS / 1000}s` : !err && code === 0 ? "wrote no nc.exe" : `exited with ${code ?? "an error"}`}${said ? `: ${said.slice(0, 300)}` : ""}`
+      return null
+    }
+    await fs.promises.mkdir(dir, { recursive: true })
+    await fs.promises.writeFile(path.join(dir, WINDOWS_NC_RUNTIME_FILE), runtimeKey).catch(() => {})
+    try {
+      await fs.promises.rename(path.join(build, "nc.exe"), exe)
+    } catch (error) {
+      if (!await isFileWithBytes(exe)) throw error
+    }
+  } finally {
+    fs.promises.rm(build, { recursive: true, force: true }).catch(() => {})
+    if (copy && copy !== build) fs.promises.rm(copy, { recursive: true, force: true }).catch(() => {})
+  }
+  sweepWindowsNcDirs(tmp, path.basename(dir), runtimeKey).catch(() => {})
+  if (copyBase && copyBase !== tmp) sweepWindowsNcDirs(copyBase, path.basename(dir), runtimeKey).catch(() => {})
+  return dir
+}
+
+async function sweepWindowsNcDirs(tmp, keep, runtimeKey = "") {
+  const now = Date.now()
+  for (const name of await fs.promises.readdir(tmp)) {
+    const shared = name.startsWith(WINDOWS_NC_PREFIX) && /^[0-9a-f]{16}$/.test(name.slice(WINDOWS_NC_PREFIX.length))
+    const build = name.startsWith(WINDOWS_NC_BUILD_PREFIX)
+    if (name === keep || (!shared && !build)) continue
+    const file = path.join(tmp, name)
+    try {
+      const ours = shared && runtimeKey &&
+        await fs.promises.readFile(path.join(file, WINDOWS_NC_RUNTIME_FILE), "utf8").then(v => v === runtimeKey, () => false)
+      const stat = await fs.promises.stat(shared ? path.join(file, "nc.exe") : file).catch(() => fs.promises.stat(file))
+      if (!ours && now - stat.mtimeMs < (shared ? 7 * 24 : 1) * 60 * 60 * 1000) continue
+      await fs.promises.rm(file, { recursive: true, force: true })
+    } catch {}
+  }
 }
 
 function agentDefinition() {
@@ -1350,6 +1567,7 @@ class Proc {
     this.agyPath = agyPath
     this.convKey = convKey
     this.userId = opts.userId || ""
+    this.sessionScope = opts.sessionScope || ""
     this.openingText = openingTextOf(opts.messages?.[0])
     this.openingImages = openingImagesOf(opts.messages?.[0])
     this.account = opts.account || null
@@ -1382,6 +1600,7 @@ class Proc {
     this.configMethodUnsupported = false
     this.configExpectation = null
     this.currentSelectionKey = null
+    this.offeredCount = 0
     this.instructionsInSession = false
     this.resumed = false
     this.child = null
@@ -1436,6 +1655,7 @@ class Proc {
     // A named account pins this process to its own Gemini dir (own OAuth token).
     if (this.geminiDir) args.push(`--gemini_dir=${this.geminiDir}`)
     if (this.workDir) args.push("--add-dir", agentPath(this.workDir))
+    args.push(...await noDefaultCustomizationsArgs(this.agyPath), ...await telemetryArgs(this.agyPath))
     try {
       const childEnv = accountEnv({ ...process.env }, this.geminiDir)
       const inheritedPath = process.env.PATH || childEnv.Path || ""
@@ -1511,7 +1731,7 @@ class Proc {
     const capabilities = init?.agentCapabilities ?? {}
     this.supportsImages = capabilities.promptCapabilities?.image === true ||
       capabilities.prompt_capabilities?.image === true
-    const appendable = systemAppend() && capabilities._meta?.antigravity?.systemPrompt?.append === true
+    const appendable = systemAppend(this.instructions) && capabilities._meta?.antigravity?.systemPrompt?.append === true
     const resumable = !!(capabilities.sessionCapabilities?.resume ?? capabilities.session_capabilities?.resume)
     this.instructionsInSession = appendable && !!this.instructions
     const meta = this.instructionsInSession
@@ -1549,12 +1769,15 @@ class Proc {
     logBridgeEvent(this, null, this.resumed ? "resumed" : "created", this.replayReason)
     // Live handshakes are authoritative for this account scope and seed the
     // same cache used by provider discovery. A late probe cannot overwrite it.
-    seedOfferedModels(this.agyPath, { key: this.accountKey }, offeredModelsFromSession(session))
+    const offered = offeredModelsFromSession(session)
+    this.offeredCount = offered.length
+    seedOfferedModels(this.agyPath, { key: this.accountKey }, offered)
     // A resumed session reports the account default; always apply the selection.
     this.currentModel = session?.models?.currentModelId ?? null
     this.configOptions = Array.isArray(session?.configOptions) ? session.configOptions : []
     if (this.model) await this.#setModel(this.model, this.selection, this.resumed)
     if (this.tools.length) await this.#waitForToolList(this.toolsVersion)
+    if (!this.toolsListed()) throw toolsUnlistedError(this.tools.length)
   }
 
   async #setConfig(config, value) {
@@ -1628,6 +1851,26 @@ class Proc {
       }
     } catch (error) {
       if (error.code === "config_confirmation_timeout" || error.code === "config_confirmation_conflict") throw error
+      const authMsg = /not (?:logged|signed) in(?:to)?\b|unauthenticated|authentication required|login required|please (?:log|sign) in|sign in again|\binvalid_grant\b/i
+      const signInReason = authMsg.test(`${error.message}\n${this.stderrTail}`)
+        ? "agy isn't signed in"
+        : !wslDistro()
+          ? cannotSignIn(this.geminiDir ? await readAccountSignIn(this.geminiDir) : await storedSignIn())
+          : ""
+      if (signInReason) {
+        const unauth = new Error(`agy bridge: ${signInReason}: sign in again in magpie, or run \`agy\` in a terminal`)
+        unauth.statusCode = 401
+        unauth.code = "unauthenticated"
+        unauth.noRetry = true
+        unauth.headers = { "X-Magpie-Sign-In": "expired" }
+        throw unauth
+      }
+      if (this.offeredCount === 0) {
+        const empty = new Error(`agy bridge: agy offered no models for this account when selecting ${model}: ${error.message}`)
+        empty.statusCode = 503
+        empty.code = "empty_model_catalog"
+        throw empty
+      }
       const wrapped = new Error(`agy bridge: model ${model} is unavailable to this agy account: ${error.message}`)
       wrapped.statusCode = 400
       throw wrapped
@@ -1645,6 +1888,10 @@ class Proc {
       const waiter = { version, resolve, reject, timer: null }
       waiter.timer = setTimeout(() => {
         this.listWaiters = this.listWaiters.filter((item) => item !== waiter)
+        if (this.listedVersion === 0) {
+          reject(toolsUnlistedError(this.tools.length, timeoutMs))
+          return
+        }
         const error = new Error(`agy bridge: agy did not confirm the client tool catalog after ${timeoutMs}ms; no prompt was sent`)
         error.statusCode = 503
         error.code = "tool_list_unconfirmed"
@@ -1652,6 +1899,10 @@ class Proc {
       }, timeoutMs)
       this.listWaiters.push(waiter)
     })
+  }
+
+  toolsListed() {
+    return !this.tools.length || this.listedVersion >= this.toolsVersion
   }
 
   listTools() {
@@ -1974,12 +2225,12 @@ class Proc {
           const detail = turn.notices.terminalDetail || loggedDetail || turn.notices.apiDetail
           if (detail || result?.stopReason === "refusal") {
             turn.agentError = true
-            throw this.#formatAgentError(detail, turn.promptGuardMatched)
+            throw await this.#agentError(turn, detail)
           }
         }
         if (result?.stopReason === "refusal") {
           const detail = await lastAgentError(this.logPath, turn.logOffset)
-          if (detail) throw this.#formatAgentError(detail, turn.promptGuardMatched)
+          if (detail) throw await this.#agentError(turn, detail)
           if (this.compaction) throw new AgentTurnError("agy bridge: upstream refused the compaction request; no summary was produced")
         }
         // A dropped retry-only notice is not an answer. An uncorroborated
@@ -1993,7 +2244,7 @@ class Proc {
             const detail = turn.notices.terminalDetail || loggedDetail || turn.notices.apiDetail
             if (detail) {
               turn.agentError = true
-              throw this.#formatAgentError(detail, turn.promptGuardMatched)
+              throw await this.#agentError(turn, detail)
             }
             if (this.compaction) {
               throw new AgentTurnError("agy bridge: upstream returned an empty compaction response; no summary was produced")
@@ -2120,8 +2371,12 @@ class Proc {
     return turn.lastPromptResult
   }
 
-  async #agentError(turn) {
-    const detail = await lastAgentError(this.logPath, turn.logOffset)
+  async #agentError(turn, fallbackDetail = "") {
+    if (turn.notices.terminalDetail === VERIFY_LINE) {
+      const logged = await logTail(this.logPath, turn.logOffset)
+      return refusedError(verifyRefused(verifyLinkIn(`${turn.notices.apiDetail || ""}\n${logged}`)))
+    }
+    const detail = fallbackDetail || await lastAgentError(this.logPath, turn.logOffset)
     return this.#formatAgentError(detail, turn.promptGuardMatched)
   }
 
@@ -2131,6 +2386,9 @@ class Proc {
     }
     if (isRefused429(detail) && turnsAway(this.instructions) && (!promptGuardEnabled() || turnsAway(outgoingSystemText(this.instructions)))) {
       return new AgentTurnError(`agy bridge: Antigravity answered 429 to this system prompt — ${hint(this.instructions)}`, "rate_limit_error")
+    }
+    if (VERIFY_REFUSAL_RE.test(detail)) {
+      return refusedError(verifyRefused(verifyLinkIn(detail)))
     }
     const classification = classifyUpstreamError(detail, { promptGuardMatched })
     const kind = classification.category === "forbidden" ? "permission_error"
@@ -2774,9 +3032,7 @@ function lastAgentErrorSync(file, offset) {
   } catch { return false } finally { if (fd !== undefined) fs.closeSync(fd) }
 }
 
-// agy writes the real upstream error only to its log; read what this turn added.
-async function lastAgentError(file, offset) {
-  let text = ""
+async function logTail(file, offset) {
   try {
     const handle = await fs.promises.open(file, "r")
     try {
@@ -2784,14 +3040,18 @@ async function lastAgentError(file, offset) {
       const start = Math.max(offset || 0, size - LOG_TAIL_BYTES)
       const buffer = Buffer.alloc(Math.max(0, size - start))
       await handle.read(buffer, 0, buffer.length, start)
-      text = buffer.toString("utf8")
+      return buffer.toString("utf8")
     } finally {
       await handle.close()
     }
   } catch {
     return ""
   }
-  return extractAgentError(text)
+}
+
+// agy writes the real upstream error only to its log; read what this turn added.
+async function lastAgentError(file, offset) {
+  return extractAgentError(await logTail(file, offset))
 }
 
 function extractAgentError(text) {
@@ -2868,9 +3128,7 @@ function withStateLock(file, fn) {
           if (Date.now() - fs.statSync(lock).mtimeMs > 5_000) {
             const owner = JSON.parse(fs.readFileSync(lock, "utf8"))
             if (Number.isSafeInteger(owner.pid) && owner.pid > 0) {
-              try { process.kill(owner.pid, 0) } catch (error) {
-                if (error.code === "ESRCH") fs.unlinkSync(lock)
-              }
+              if (!processExists(owner.pid)) fs.unlinkSync(lock)
             }
           }
         } catch {}
@@ -2931,7 +3189,7 @@ function park(proc) {
     historyHashSansInputs: digest(historyKey(stripToolUseInputs(proc.expectedMessages))),
     toolUseIdentitiesHash: digest(toolUseIdentitiesKey(proc.expectedMessages) ?? ""),
     instructionsHash: digest(instructionsIdentity(proc.instructions)),
-    systemAppend: systemAppend(),
+    systemAppend: systemAppend(proc.instructions),
     workDir: proc.workDir,
     userCloak: USER_CLOAK,
     at: Date.now(),
@@ -2945,7 +3203,7 @@ function peekParked(convKey, opts) {
   const entry = parked.get(convKey)
   if (!entry || Date.now() - entry.at > RESUME_TTL_MS || (entry.workDir ?? null) !== (opts.workDir ?? null) ||
     entry.instructionsHash !== digest(instructionsIdentity(opts.instructions)) ||
-    entry.systemAppend !== systemAppend() ||
+    entry.systemAppend !== systemAppend(opts.instructions) ||
     entry.userCloak !== USER_CLOAK) return null
   if (entry.historyHash === digest(historyKey(opts.history))) return entry
   const ids = toolUseIdentitiesKey(opts.history)
@@ -3116,7 +3374,7 @@ async function withAcquireLock(key, fn) {
 
 function findFlattenedProc(opts) {
   const candidates = [...pool.values()].filter(proc => !proc.dead && !proc.retiring && !proc.turn && !proc.steering && !proc.continuingCancel && !proc.compaction && !proc.ephemeral && proc.hasSentFirstTurn &&
-    (proc.account || null) === (opts.account || null) && proc.agyPath === findAgy() && proc.userId === (opts.userId || "") &&
+    (proc.account || null) === (opts.account || null) && sameSessionScope(proc, opts.sessionScope) && proc.agyPath === findAgy() && proc.userId === (opts.userId || "") &&
     proc.workDir === opts.workDir && proc.model === opts.model && proc.toolsSignature === JSON.stringify(opts.tools) &&
     sameInstructions(proc.instructions, opts.instructions) && isContinuedOpening(proc, opts.messages?.[0]))
   candidates.sort((a, b) => b.openingText.length - a.openingText.length)
@@ -3238,16 +3496,22 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     await Promise.race([existing.turn.settled, new Promise((resolve) => setTimeout(resolve, CANCEL_SETTLE_MS))])
   }
   if (existing && !existing.dead && existing.turn) {
-    const lineage = lineageVerdict(existing, existing.turn, opts)
-    if (lineage === "fork") {
+    let lineage = lineageVerdict(existing, existing.turn, opts)
+    if (lineage === "dropped") {
+      const held = existing.turn
+      const kept = await keepDroppedTurn(existing, held, opts)
+      logBridgeEvent(existing, held, kept ? "kept" : "keep_failed", "lineage_dropped", opts)
+      if (!kept) lineage = "fork"
+    }
+    if (lineage === "fork" || lineage === "answered") {
       opts.validateReplay?.()
-      opts.replayReason = "lineage_fork"
+      opts.replayReason = lineage === "answered" ? "lineage_answered" : "lineage_fork"
       const orphan = existing.turn
-      if (!staleTurnVerdict(existing, orphan).stale && !pendingCallsAnsweredIn(orphan, opts.history)) {
+      if (lineage === "fork" && !staleTurnVerdict(existing, orphan).stale && !pendingCallsAnsweredIn(orphan, opts.history)) {
         logBridgeEvent(existing, orphan, "isolated", "lineage_fork", opts)
         convKey = `${convKey.split(":fork:")[0]}:fork:${randomUUID()}`
       } else {
-        logBridgeEvent(existing, orphan, "superseded", "lineage_fork", opts, { superseded_turn_id: orphan.turnId })
+        logBridgeEvent(existing, orphan, "superseded", opts.replayReason, opts, { superseded_turn_id: orphan.turnId })
         await reclaimStaleTurn(existing, orphan, SUPERSEDED_NOTE)
       }
       existing = null
@@ -3272,8 +3536,11 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
       existing.workDir === opts.workDir && sameInstructions(existing.instructions, opts.instructions) &&
       existing.matchesHistory(matchedHistory)
     if (compatible && !(isFreshConversation && existing.hasSentFirstTurn)) {
-      await existing.updateTools(opts.tools)
-      return { proc: existing, history: matchedHistory }
+      if (!opts.tools.length || existing.listedVersion > 0 || existing.watchers.size) {
+        await existing.updateTools(opts.tools)
+        if (existing.toolsListed()) return { proc: existing, history: matchedHistory }
+      }
+      opts.replayReason ||= "tools_unlisted"
     }
     opts.validateReplay?.()
     opts.replayReason ||= existing.dead ? "process_dead"
@@ -3329,6 +3596,23 @@ function logBridgeEvent(proc, turn, action, reason, meta = {}, extra = {}) {
   try { process.stderr.write("[agy-bridge] " + JSON.stringify(row) + "\n") } catch {}
 }
 
+const BRIDGE_CALL_ID = /^toolu_[0-9a-f]{24}$/i
+
+function movedOnVerdict(turn, messages) {
+  if (!turn || turn.attached || turn.steering || turn.cancelRequested || !Array.isArray(messages)) return null
+  if (!turn.hasPendingMcp()) return null
+  const own = new Set(turn.calls.map((call) => call.id))
+  let last = -1
+  messages.forEach((message, index) => {
+    if (Array.isArray(message?.content) && message.content.some((block) =>
+      (block?.type === "tool_use" && own.has(block.id)) || (block?.type === "tool_result" && own.has(block.tool_use_id)))) last = index
+  })
+  if (last < 0) return null
+  const foreign = messages.slice(last + 1).some((message) => message?.role === "assistant" && Array.isArray(message.content) &&
+    message.content.some((block) => block?.type === "tool_use" && typeof block.id === "string" && block.id && !BRIDGE_CALL_ID.test(block.id)))
+  return foreign ? { stale: true, reason: "moved_on" } : null
+}
+
 function staleTurnVerdict(proc, turn, now = Date.now()) {
   if (!turn || turn.cancelRequested) return { stale: false, reason: "cancelling" }
   if (turn.attached) return { stale: false, reason: "attached" }
@@ -3347,6 +3631,10 @@ function lineageVerdict(proc, turn, opts) {
   // history, so the live turn can never receive them: it was abandoned (e.g. its
   // tool-result request failed, or client-side compaction rewrote the base).
   if (pendingCallsAnsweredIn(turn, history)) return "fork"
+  const allIds = new Set(turn.calls.map((call) => call.id).filter(Boolean))
+  const carriedAll = (opts.messages || []).some((message) => Array.isArray(message?.content) &&
+    message.content.some((block) => block?.type === "tool_use" && allIds.has(block.id)))
+  if (carriedAll && carriedAnswered(opts.messages, allIds)) return "answered"
   const base = turn.baseHistory
   if (!Array.isArray(history)) return null
   // The request no longer follows the conversation the waiting turn was told
@@ -3374,7 +3662,67 @@ function lineageVerdict(proc, turn, opts) {
   if (!carried && !recorded && Array.isArray(expected) && expected.length > base.length &&
     history.length === expected.length &&
     historyKey(withoutInputs(history)) === historyKey(withoutInputs(expected))) return null
+  if (!carried && !recorded && !opts.hasToolResults && droppedPendingCalls(turn, expected, base, history)) return "dropped"
   return carried || recorded ? "conflict" : "fork"
+}
+
+function droppedPendingCalls(turn, expected, base, history) {
+  if (!Array.isArray(expected) || expected.length <= base.length || history.length !== expected.length) return false
+  const pending = new Set(turn.calls.filter((call) => call.id && !call.result && !call.mcpResponded).map((call) => call.id))
+  if (!pending.size) return false
+  let removed = 0
+  const stripped = expected.map((message) => {
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) return message
+    const content = message.content.filter((block) => !(block?.type === "tool_use" && pending.has(block.id)))
+    removed += message.content.length - content.length
+    return { ...message, content }
+  })
+  if (removed !== pending.size) return false
+  const last = stripped.at(-1)
+  if (last?.role !== "assistant" || !last.content.some((block) => block?.type === "text" && block.text?.trim())) return false
+  if (stripped.slice(base.length).some((message) => Array.isArray(message.content) && !message.content.length)) return false
+  return historyKey(stripped) === historyKey(history)
+}
+
+function carriedAnswered(messages, ids) {
+  const open = new Set()
+  for (const message of messages || []) {
+    if (!Array.isArray(message?.content)) continue
+    for (const block of message.content) {
+      if (block?.type === "tool_use" && ids.has(block.id)) open.add(block.id)
+      else if (block?.type === "tool_result") open.delete(block.tool_use_id)
+    }
+  }
+  return open.size === 0
+}
+
+async function keepDroppedTurn(proc, turn, opts) {
+  if (proc.dead || proc.stopping || proc.retiring || proc.steering || proc.turn !== turn ||
+    turn.steering || turn.done || turn.finalized || !Array.isArray(opts.history)) return false
+  const known = new Set(proc.tools.map((tool) => tool.name))
+  const toolsGrew = (opts.tools || []).some((tool) => !known.has(tool.name))
+  if (toolsGrew || proc.workDir !== opts.workDir || !sameInstructions(proc.instructions, opts.instructions)) return false
+  const results = turn.calls.filter((call) => call.id && !call.result && !call.mcpResponded).map((call) => ({
+    block: { tool_use_id: call.id, content: DROPPED_NOTE, is_error: true },
+    call,
+    result: { content: [{ type: "text", text: DROPPED_NOTE }], isError: true },
+  }))
+  if (!results.length) return false
+  proc.steering = true
+  try {
+    proc.continueWith(results)
+    if (turn.hasPendingMcp()) return false
+    if (!turn.done && !turn.finalized && !proc.cancelTurn(turn, [])) return false
+    await Promise.race([turn.settled, new Promise((resolve) => setTimeout(resolve, CANCEL_SETTLE_MS))])
+    if (turn.done && !turn.finalized) proc.finalizeTurn(turn)
+    if (!turn.finalized || proc.dead || proc.stopping || proc.historyInvalid || proc.turn) return false
+    proc.expectedMessages = opts.history.map((message) => ({ ...message }))
+    return true
+  } catch {
+    return false
+  } finally {
+    proc.steering = false
+  }
 }
 
 function pendingCallsAnsweredIn(turn, history) {
@@ -3439,7 +3787,7 @@ async function recoverStaleTurn(ctx) {
     if (current !== ctx.proc || current?.turn !== ctx.turn) {
       throw new ConflictError("agy bridge: this turn was already replaced. Stop resending this request.", "tool_state_conflict")
     }
-    const verdict = staleTurnVerdict(current, ctx.turn)
+    const verdict = movedOnVerdict(ctx.turn, ctx.body.messages) ?? staleTurnVerdict(current, ctx.turn)
     // As in the local fix, lineage supersession belongs to acquisition of a
     // new prompt. Unmatched results alone must not reclaim an unexpired owner.
     if (!verdict.stale) return null
@@ -3469,24 +3817,14 @@ function parseUserImage(block) {
   return imageContent({ ...block, source: { ...block.source, media_type: mediaType === "image/jpg" ? "image/jpeg" : mediaType } })
 }
 
-function parseUserDocumentText(block) {
+function parseUserDocumentText(block, inToolResult = false) {
   if (block?.type !== "document") return ""
-  const title = typeof block.title === "string" && block.title.trim() ? block.title.trim() : ""
-  const src = block.source
-  let text = null
-  if (src?.type === "text" && typeof src.data === "string") {
-    text = src.data
-  } else if (src?.type === "content") {
-    if (typeof src.content === "string") {
-      text = src.content
-    } else if (Array.isArray(src.content) && src.content.every((part) => part?.type === "text" && typeof part.text === "string")) {
-      text = src.content.map((part) => part.text).join("\n")
-    }
-  }
+  const text = documentText(block, { inToolResult })
   if (text === null) {
-    throw new UnsupportedContent("a binary or URL document block in a user message (agy's ACP prompt accepts text and images only)")
+    const { what, hint } = documentRefusal(block)
+    throw new UnsupportedContent(what, hint)
   }
-  return title ? `[document: ${title}]\n${text}\n[end of document]` : text
+  return text
 }
 
 function parseSearchResultText(block) {
@@ -3996,7 +4334,9 @@ function assistantTextOf(message) {
   if (!Array.isArray(message.content)) return null
   let text = ""
   for (const block of message.content) {
-    if (!block || block.type !== "text" || typeof block.text !== "string") return null
+    if (!block) return null
+    if (block.type === "thinking" || block.type === "redacted_thinking") continue
+    if (block.type !== "text" || typeof block.text !== "string") return null
     text += block.text
   }
   return text
@@ -4044,10 +4384,72 @@ function lastAssistantCalls(messages) {
     ? message.content.filter(block => block.type === "tool_use") : [])
 }
 
-function matchToolResults(body, blocks, accountName = null) {
-  // A tool result only ever belongs to the account that issued the call; a
-  // continuation addressed to another account must not match it.
-  const own = (match) => match && (match.proc.account ?? null) === (accountName ?? null) ? match : undefined
+function foldSplitCalls(body) {
+  const messages = body?.messages
+  if (!Array.isArray(messages)) return body
+  let changed = false
+  const out = messages.map((message) => message)
+  for (let index = 0; index < out.length; index++) {
+    const message = out[index]
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) continue
+    const uses = message.content.filter((block) => block?.type === "tool_use")
+    if (uses.length < 2) continue
+    const head = uses[0]
+    if (!BRIDGE_CALL_ID.test(head.id ?? "") || uses.slice(1).some((use) => BRIDGE_CALL_ID.test(use.id ?? "") || !use.id)) continue
+    if (uses.some((use) => use.name !== head.name)) continue
+    const keyOf = (use) => {
+      const input = use.input
+      if (!input || typeof input !== "object" || Array.isArray(input)) return null
+      const keys = Object.keys(input)
+      return keys.length === 1 && Array.isArray(input[keys[0]]) ? keys[0] : null
+    }
+    const key = keyOf(head)
+    if (!key || uses.some((use) => keyOf(use) !== key)) continue
+    const ids = new Set(uses.map((use) => use.id))
+    if (ids.size !== uses.length) continue
+    const results = []
+    let end = index + 1
+    while (end < out.length && out[end]?.role !== "assistant") end++
+    for (let at = index + 1; at < end; at++) {
+      const content = out[at]?.content
+      if (!Array.isArray(content)) continue
+      for (const block of content) if (block?.type === "tool_result" && ids.has(block.tool_use_id)) results.push(block)
+    }
+    if (results.length && results.length !== uses.length) continue
+    const folded = { ...head, input: { [key]: uses.flatMap((use) => use.input[key]) } }
+    out[index] = { ...message, content: message.content.filter((block) => block?.type !== "tool_use" || block === head).map((block) => (block === head ? folded : block)) }
+    if (results.length) {
+      const byId = new Map(results.map((block) => [block.tool_use_id, block]))
+      const parts = (block) => typeof block.content === "string" ? [{ type: "text", text: block.content }]
+        : Array.isArray(block.content) ? block.content : block.content == null ? [] : [block.content]
+      const ordered = uses.map((use) => byId.get(use.id))
+      const merged = { ...byId.get(head.id), content: ordered.flatMap(parts) }
+      if (ordered.every((block) => block.is_error)) merged.is_error = true
+      else delete merged.is_error
+      for (let at = index + 1; at < end; at++) {
+        const content = out[at]?.content
+        if (!Array.isArray(content) || !content.some((block) => block?.type === "tool_result" && ids.has(block.tool_use_id))) continue
+        out[at] = { ...out[at], content: content.flatMap((block) => {
+          if (block?.type !== "tool_result" || !ids.has(block.tool_use_id)) return [block]
+          return block.tool_use_id === head.id ? [merged] : []
+        }) }
+      }
+      for (let at = end - 1; at > index; at--) {
+        if (Array.isArray(out[at]?.content) && out[at].content.length === 0) { out.splice(at, 1); end-- }
+      }
+    }
+    changed = true
+  }
+  return changed ? { ...body, messages: out } : body
+}
+
+function sameSessionScope(proc, sessionScope = "") {
+  return (proc?.sessionScope || "") === (sessionScope || "")
+}
+
+function matchToolResults(body, blocks, accountName = null, sessionScope = "") {
+  // A tool result only ever belongs to the account and session scope that issued the call.
+  const own = (match) => match && (match.proc.account ?? null) === (accountName ?? null) && sameSessionScope(match.proc, sessionScope) ? match : undefined
   const direct = blocks.map(block => ({ block, match: own(toolCalls.get(block.tool_use_id)) }))
   if (direct.every(item => item.match)) return direct
   const { history } = trailingMessages(body)
@@ -4057,7 +4459,7 @@ function matchToolResults(body, blocks, accountName = null) {
     blocks.some(block => !byID.has(block.tool_use_id))) return direct
   let found = null
   for (const proc of allProcs) {
-    if ((proc.account ?? null) !== (accountName ?? null)) continue
+    if ((proc.account ?? null) !== (accountName ?? null) || !sameSessionScope(proc, sessionScope)) continue
     if (!proc.turn || proc.turn.finalized || !proc.matchesHistory(history)) continue
     const shown = lastAssistantCalls(proc.expectedMessages)
     if (shown.length !== calls.length || shown.some((call, index) =>
@@ -4125,13 +4527,24 @@ function sameInstructions(a, b) {
   return instructionsIdentity(a) === instructionsIdentity(b)
 }
 
+function requestSessionScope(fetchInput, init) {
+  const headers = new Headers(
+    init?.headers ?? (fetchInput instanceof Request ? fetchInput.headers : undefined) ?? {},
+  )
+  const rawSession = headers.get("x-magpie-session")?.trim() || ""
+  const session = /^magpie-[0-9a-f]{24}$/.test(rawSession) ? "" : rawSession.slice(0, 128)
+  const subagent = (headers.get("x-magpie-subagent")?.trim() || "").slice(0, 64)
+  return session || subagent ? `${session}\n${subagent}` : ""
+}
+
 // The model is not part of the key: agy switches models inside a live session.
-function conversationKey(rawBody) {
+function conversationKey(rawBody, sessionScope = "") {
   const body = canonicalBody(rawBody)
   const system = historyKey([{ role: "system", content: instructionsIdentity(systemText(body)) }])
   const first = body.messages?.[0]
   const firstText = first ? historyKey([first]) : ""
-  const discriminator = body.metadata?.user_id || ""
+  const userId = body.metadata?.user_id || ""
+  const discriminator = sessionScope ? `${userId}\n${sessionScope}` : userId
   const source = discriminator + "\n" + system + "\n===\n" + firstText
   return createHash("sha256").update(source).digest("hex")
 }
@@ -4319,7 +4732,7 @@ function normalizeTools(body) {
   return tools
 }
 
-function blockText(block) {
+function blockText(block, inToolResult = false) {
   if (typeof block === "string") return block
   if (!block || typeof block !== "object" || Array.isArray(block)) {
     throw new UnsupportedContent("a non-object content block")
@@ -4329,7 +4742,7 @@ function blockText(block) {
   if (block.type === "tool_reference" && typeof block.tool_name === "string") {
     return `Loaded tool: ${block.tool_name}`
   }
-  if (block.type === "document") return parseUserDocumentText(block)
+  if (block.type === "document") return parseUserDocumentText(block, inToolResult)
   if (block.type === "search_result") return parseSearchResultText(block)
   if (block.type === "image") {
     parseUserImage(block)
@@ -4339,7 +4752,7 @@ function blockText(block) {
     const inner = Array.isArray(block.content)
       ? block.content.map((part) => {
         if (part?.type === "image") return "[image returned by tool]"
-        return blockText(part)
+        return blockText(part, true)
       }).join("")
       : String(block.content ?? "")
     return `[tool result${block.tool_use_id ? " id=" + block.tool_use_id : ""}]\n${inner}\n[end of tool result]`
@@ -4350,7 +4763,7 @@ function blockText(block) {
 
 function messageText(message) {
   if (typeof message.content === "string") return message.content
-  if (Array.isArray(message.content)) return message.content.map(blockText).join("")
+  if (Array.isArray(message.content)) return message.content.map((part) => blockText(part)).join("")
   return String(message.content ?? "")
 }
 
@@ -4807,7 +5220,7 @@ function toolResult(block) {
       if (part?.type === "tool_reference" && typeof part.tool_name === "string") {
         return { type: "text", text: `Loaded tool: ${part.tool_name}` }
       }
-      if (part?.type === "document") return { type: "text", text: parseUserDocumentText(part) }
+      if (part?.type === "document") return { type: "text", text: parseUserDocumentText(part, true) }
       if (part?.type === "search_result") return { type: "text", text: parseSearchResultText(part) }
       if (part?.type === "image" && part.source?.type === "base64" && part.source.data) {
         return {
@@ -6060,10 +6473,11 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                 error: cachedAgyError || `agy CLI not found. Update magpie and try again to have it installed, or install Antigravity CLI yourself: ${AGY_MANUAL} — then run \`agy\` once to sign in.`,
               }
             }
-            const probe = await execOnce(agy, ["models"], { timeoutMs: 15_000 })
+            const modelsTimeoutMs = configuredTimeout("AGY_BRIDGE_MODELS_TIMEOUT_MS", LIST_MODELS_TIMEOUT_MS)
+            const probe = await execOnce(agy, await modelsArgs(agy), { timeoutMs: modelsTimeoutMs })
             if (probe.err || probe.code !== 0 || !probe.stdout.trim()) {
               const why = probe.timedOut
-                ? "timed out after 15s"
+                ? `timed out after ${Math.round(modelsTimeoutMs / 1000)}s`
                 : (probe.stderr || probe.stdout || "").trim() || probe.err?.message || "unknown error"
               return {
                 type: "failed",
@@ -6091,7 +6505,7 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
               const account = nativeAccount({ type: "api", key: result.key })
               const agy = findAgy()
               if (!agy) return { type: "failed", error: "agy CLI not found. Install the CLI before registering this account." }
-              const probe = await execOnce(agy, [`--gemini_dir=${account.dir}`, "models"], { timeoutMs: 15_000, env: accountEnv(process.env, account.dir), signal })
+              const probe = await execOnce(agy, await modelsArgs(agy, [`--gemini_dir=${account.dir}`]), { timeoutMs: configuredTimeout("AGY_BRIDGE_MODELS_TIMEOUT_MS", LIST_MODELS_TIMEOUT_MS), env: accountEnv(process.env, account.dir), signal })
               if (signal?.aborted) return { type: "failed", error: "Account registration was cancelled." }
               if (probe.err || probe.code !== 0 || !probe.stdout.trim()) return { type: "failed", error: "agy could not verify this saved account. Check its login before registering it." }
               forgetStoredSignIn({ dead: true })
@@ -6135,7 +6549,9 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
             if (!agy) return jsonError(503, cachedAgyError || "agy CLI not found on this machine")
             let body
             try {
-              const raw = typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body)
+              const raw = init.body != null
+                ? (typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body))
+                : (typeof fetchInput?.text === "function" ? await fetchInput.text() : "")
               body = JSON.parse(raw)
               validateBody(body)
             } catch (error) {
@@ -6162,8 +6578,9 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
             } catch (error) {
               return jsonError(error.statusCode ?? 503, error instanceof NativeAccountError ? error.message : "Could not read the selected Bridge account.", error.code, true)
             }
-            if (!account.dir && !wslDistro()) {
-              const notSignedIn = cannotSignIn(storedSignInNow())
+            if (!wslDistro()) {
+              const signInState = account.dir ? await readAccountSignIn(account.dir) : storedSignInNow()
+              const notSignedIn = cannotSignIn(signInState)
               if (notSignedIn) {
                 return jsonError(
                   401,
@@ -6175,16 +6592,19 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
             }
             const requestedModel = modelId.replace(/\[1m\]$/i, "")
             const layout = canonicalBody(body) === body ? "hoisted" : "inline"
-            body = { ...canonicalBody(body), model: requestedModel }
+            body = { ...foldSplitCalls(canonicalBody(body)), model: requestedModel }
             let model
             try {
               model = resolveAgyModel(await loadModelCatalog(agy, false, account), requestedModel, body)
             } catch (error) {
-              return jsonError(error.statusCode ?? 502, error.message, error.code, error.noRetry)
+              return jsonError(error.statusCode ?? 502, error.message, error.code,
+                error.headers ? { noRetry: error.noRetry, headers: error.headers } : error.noRetry)
             }
             const selection = { model: requestedModel, effort: requestedEffort(body) }
-            // Accounts never share conversations, pooled processes or dedup state.
-            const convKey = account.name ? `account:${account.name}::${conversationKey(body)}` : conversationKey(body)
+            const sessionScope = requestSessionScope(fetchInput, init)
+            // Accounts and session/subagent scopes never share conversations, pooled processes or dedup state.
+            const baseConvKey = conversationKey(body, sessionScope)
+            const convKey = account.name ? `account:${account.name}::${baseConvKey}` : baseConvKey
             const trailing = trailingMessages(body)
             const isFresh = trailing.history.length === 0
             const resultBlocks = extractToolResults(body)
@@ -6238,9 +6658,10 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                 }
               }
               if (isEphemeralSidePrompt(trailing, resultBlocks)) {
+                const useSystemAppend = systemAppend(instructions)
                 validateAcpPromptBudget(
-                  renderReplayPromptParts(body, callerWorkDir, systemAppend() && !!instructions, instructions),
-                  systemAppend() ? instructions : "", body,
+                  renderReplayPromptParts(body, callerWorkDir, useSystemAppend && !!instructions, instructions),
+                  useSystemAppend ? instructions : "", body,
                 )
                 const key = `${convKey}:ephemeral:${randomUUID()}`
                 promptAttempt = claimPromptAttempt(promptAttemptKey(key, body, trailing, model, selection, [], instructions))
@@ -6267,17 +6688,21 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                   if (block?.type !== "tool_use") continue
                   const entry = toolCalls.get(block.id)
                   if (!entry || entry.call.clientSeen) continue
-                  if ((entry.proc.account ?? null) !== (account.name ?? null)) continue
+                  if ((entry.proc.account ?? null) !== (account.name ?? null) || !sameSessionScope(entry.proc, sessionScope)) continue
                   entry.call.clientSeen = true
                   entry.turn.touchClient()
                 }
               }
               const acquireOpts = { model, selection, tools, workDir, instructions, history: trailing.history,
                 messages: body.messages, layout, nonstream: body.stream === false,
-                account: account.name, accountKey: account.key, geminiDir: account.dir, userId: body.metadata?.user_id || "",
-                validateReplay: () => validateAcpPromptBudget(
-                  renderReplayPromptParts(body, callerWorkDir, systemAppend() && !!instructions, instructions),
-                  systemAppend() ? instructions : "", body) }
+                account: account.name, accountKey: account.key, geminiDir: account.dir,
+                userId: body.metadata?.user_id || "", sessionScope,
+                validateReplay: () => {
+                  const useSystemAppend = systemAppend(instructions)
+                  return validateAcpPromptBudget(
+                    renderReplayPromptParts(body, callerWorkDir, useSystemAppend && !!instructions, instructions),
+                    useSystemAppend ? instructions : "", body)
+                } }
               const claim = (continuationOpts = null) => {
                 if (!promptAttempt) {
                   const key = promptAttemptKey(convKey, body, trailing, model, selection, tools, instructions)
@@ -6301,7 +6726,7 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                 return beginTurn(proc, history, body, callerWorkDir, model, selection, promptAttempt, promptGuardMatched, acquireOpts.cancelContinuation)
               }
               if (resultBlocks.length) {
-                const matches = matchToolResults(body, resultBlocks, account.name)
+                const matches = matchToolResults(body, resultBlocks, account.name, sessionScope)
                 const found = matches.filter((item) => item.match)
                 if (found.length) {
                   if (found.length !== matches.length) {
@@ -6385,7 +6810,13 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                       : toolsGrew ? "tools_grew" : proc.workDir !== workDir ? "work_dir_changed"
                       : !sameInstructions(proc.instructions, instructions) ? "instructions_changed"
                       : turn.done ? "tool_turn_ended" : turn.cancelRequested ? "tool_turn_cancelling" : "incomplete_tool_results"
-                    logBridgeEvent(proc, turn, "replay", acquireOpts.replayReason)
+                    logBridgeEvent(proc, turn, "replay", acquireOpts.replayReason, acquireOpts, {
+                      history: trailingMessages(body).history.length,
+                      expected_history: Array.isArray(proc.expectedMessages) ? proc.expectedMessages.length : null,
+                      tools_grew: !!toolsGrew,
+                      work_dir_changed: proc.workDir !== workDir,
+                      instructions_changed: !sameInstructions(proc.instructions, instructions),
+                    })
                     claim()
                     // Incompatible context needs replay. Keep the results for
                     // the new session and close the old process's calls.
@@ -6501,7 +6932,8 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                     canRestore ? { clientCancelled: true, proc } : {})
                 }
               }
-              return jsonError(error.statusCode ?? 502, error.message, error.code, error.noRetry)
+              return jsonError(error.statusCode ?? 502, error.message, error.code,
+                error.headers ? { noRetry: error.noRetry, headers: error.headers } : error.noRetry)
             }
           },
         }
@@ -6601,7 +7033,7 @@ process.once("exit", () => {
       try { fs.rmSync(proc.workspace, { recursive: true, force: true }) } catch {}
     }
   }
-  if (shimDir) {
+  if (shimDir && shimDirOwned) {
     try { fs.rmSync(shimDir, { recursive: true, force: true }) } catch {}
   }
 })

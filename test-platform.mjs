@@ -200,3 +200,31 @@ test("WSL quota and context unlock reject before touching host credentials or la
   assert.throws(() => wslPath("//server/share", "Ubuntu", "win32"), /UNC/)
   assert.throws(() => wslAgyPath({ ...env, AGY_PATH: "agy --foo; echo bad" }, "win32"), /one executable/)
 })
+
+test("proc.mjs treats Linux zombie and dead processes as non-existent even when kill(pid, 0) succeeds", async () => {
+  const { processExists, processStatus, processZombie } = await import("./proc.mjs")
+  const okKill = () => {}
+  assert.equal(processZombie(42, { readFile: () => "42 (node (v20)) Z 1 42 42 0 -1" }), true)
+  assert.equal(processZombie(42, { readFile: () => "42 (node) X 1 42 42 0 -1" }), true)
+  assert.equal(processZombie(42, { readFile: () => "42 (node) S 1 42 42 0 -1" }), false)
+  assert.equal(processExists(42, { platform: "linux", kill: okKill, readFile: () => "42 (agy) Z 1 42 42" }), false)
+  assert.equal(processStatus(42, { platform: "linux", kill: okKill, readFile: () => "42 (agy) Z 1 42 42" }).state, "dead")
+  assert.equal(processExists(42, { platform: "linux", kill: okKill, readFile: () => "42 (agy) S 1 42 42" }), true)
+  assert.equal(processExists(42, { platform: "darwin", kill: okKill, readFile: () => "42 (agy) Z 1 42 42" }), true)
+  assert.equal(processExists(42, { platform: "linux", kill: () => { throw Object.assign(new Error("nope"), { code: "ESRCH" }) } }), false)
+  assert.equal(processExists(42, { platform: "linux", kill: () => { throw Object.assign(new Error("perm"), { code: "EPERM" }) }, readFile: () => "42 (agy) S 1 42 42" }), true)
+})
+
+
+test("windowsNcBuild builds GUI-subsystem nc.exe only under bun/magpie-bun runtimes", async () => {
+  const { windowsNcBuild } = await import("./platform.mjs")
+  assert.deepEqual(
+    windowsNcBuild("C:\\Users\\Alice\\AppData\\Local\\magpie-bun.exe", "C:\\plugin\\mcp-server.mjs", "C:\\tmp\\nc.exe", { bun: "1.2.0" }),
+    {
+      file: "C:\\Users\\Alice\\AppData\\Local\\magpie-bun.exe",
+      args: ["build", "--compile", "--windows-hide-console", "C:\\plugin\\mcp-server.mjs", "--outfile", "C:\\tmp\\nc.exe"],
+    },
+  )
+  assert.equal(windowsNcBuild("C:\\Program Files\\nodejs\\node.exe", "C:\\plugin\\mcp-server.mjs", "C:\\tmp\\nc.exe", { node: "22.0.0" }), null)
+  assert.equal(windowsNcBuild("C:\\Program Files\\nodejs\\node.exe", "C:\\plugin\\mcp-server.mjs", "C:\\tmp\\nc.exe", { bun: "1.2.0" }), null)
+})

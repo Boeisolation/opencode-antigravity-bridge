@@ -96,6 +96,7 @@ test("CloudCode model metadata sets real context, output, image capabilities, an
   const fakeDir = path.join(root, "fake-cloud-agy")
   const fakeBin = writeFakeAgy(fakeDir, `
 const args = process.argv.slice(2);
+if (args.includes("--help")) process.exit(0);
 if (args.includes("models")) {
   console.log([
     "gemini-3.8-flash-low Gemini 3.8 Flash (low)",
@@ -218,6 +219,7 @@ test("silent failures and 0-model-step SQLite errors never return fake HTTP 200"
 import fs from "node:fs";
 import path from "node:path";
 const args = process.argv.slice(2);
+if (args.includes("--help")) process.exit(0);
 if (args.includes("models")) {
   console.log("gemini-test-medium Gemini Test (medium)");
   process.exit(0);
@@ -360,6 +362,7 @@ import fs from "node:fs";
 import readline from "node:readline";
 const args = process.argv.slice(2);
 const logFile = process.env.FAKE_TS_LOG;
+if (args.includes("--help")) process.exit(0);
 if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
 if (args.includes("models")) {
   if (process.env.FAKE_MODELS_FAIL === "1") process.exit(1);
@@ -490,6 +493,7 @@ import readline from "node:readline";
 const args = process.argv.slice(2);
 const logFile = process.env.FAKE_WAIT_LOG;
 const record = (entry) => fs.appendFileSync(logFile, JSON.stringify(entry) + "\\n");
+if (args.includes("--help")) process.exit(0);
 if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
 if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
 const sessionId = "s-wait";
@@ -676,6 +680,7 @@ test("disabled account ToS notice never leaks as assistant text and emits 403 pe
   const fakeBin = writeFakeAgy(fakeDir, `
 import readline from "node:readline";
 const args = process.argv.slice(2);
+if (args.includes("--help")) process.exit(0);
 if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
 if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
 let count = 0;
@@ -778,6 +783,7 @@ import net from "node:net";
 import readline from "node:readline";
 const args = process.argv.slice(2);
 const logFile = process.env.FAKE_WARM_LOG;
+if (args.includes("--help")) process.exit(0);
 if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
 if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
 const pidTag = process.pid;
@@ -925,6 +931,1011 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
     const mainPrompts = logEvents.filter(e => e.event === "session/prompt" && e.pid === news[0].pid)
     assert.equal(mainPrompts.length, 2, JSON.stringify(mainPrompts))
     assert.equal(mainPrompts[1].text.trim(), "部署免检定位验证")
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
+
+
+test("documents.mjs handles http(s) URLs, base64 UTF-8 text/JSON/XML, tool_result binary PDFs, and clear user refusals", async () => {
+  const { documentText, documentRefusal } = await import("./documents.mjs")
+  assert.equal(
+    documentText({ type: "document", title: "Spec", source: { type: "url", url: "https://example.invalid/spec" } }),
+    "[document: Spec at https://example.invalid/spec; its content is not attached here. Fetch the URL with a tool to read it.]",
+  )
+  assert.equal(
+    documentText({ type: "document", title: "cfg.json", source: { type: "base64", media_type: "application/json; charset=utf-8", data: Buffer.from('{"ok":true}').toString("base64") } }),
+    '[document: cfg.json]\n{"ok":true}\n[end of document]',
+  )
+  assert.equal(
+    documentText({ type: "document", title: "bad.txt", source: { type: "base64", media_type: "text/plain", data: Buffer.from([0xff, 0xfe]).toString("base64") } }),
+    null,
+  )
+  assert.equal(
+    documentText({ type: "document", title: "report.pdf", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0=" } }, { inToolResult: false }),
+    null,
+  )
+  assert.equal(
+    documentText({ type: "document", title: "report.pdf", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0=" } }, { inToolResult: true }),
+    "[document: report.pdf: a PDF that could not be attached here. Extract its text with a tool (pdftotext, say) to read it.]",
+  )
+  assert.match(documentRefusal({ type: "document", source: { type: "file", file_id: "f_1" } }).what, /Files API file_id/)
+  assert.match(documentRefusal({ type: "document", source: { type: "url", url: "ftp://x/y" } }).what, /other than http\(s\)/)
+})
+
+
+test("Individual quota reached maps to 429 with reset time and Verification Required extracts log link into 403 permission_error", async () => {
+  const convDir = path.join(root, "conv-qv")
+  const accountsDir = path.join(root, "accounts-qv")
+  const stateFile = path.join(root, "state-qv.json")
+  const fakeDir = path.join(root, "fake-qv-agy")
+  fs.mkdirSync(convDir, { recursive: true })
+  fs.mkdirSync(accountsDir, { recursive: true })
+  let count = 0
+  const fakeBin = writeFakeAgy(fakeDir, `
+import fs from "node:fs";
+import readline from "node:readline";
+const args = process.argv.slice(2);
+if (args.includes("--help")) process.exit(0);
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
+const logIdx = args.indexOf("--log-file");
+const agyLog = logIdx >= 0 ? args[logIdx + 1] : null;
+let count = 0;
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+readline.createInterface({ input: process.stdin }).on("line", line => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } }, agentInfo: { name: "fake-agy", version: "1.5.9" } } });
+  } else if (msg.method === "session/new") {
+    count++;
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-qv-" + count } });
+  } else if (msg.method === "session/set_model" || msg.method === "session/set_config_option") {
+    send({ jsonrpc: "2.0", id: msg.id, result: {} });
+  } else if (msg.method === "session/prompt") {
+    const sid = msg.params?.sessionId;
+    const text = (msg.params?.prompt || []).map(p => p.text || "").join("\\n");
+    let reply = "ok";
+    if (text.includes("TRIGGER_QUOTA")) {
+      reply = "\\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h18m40s.\\n";
+    } else if (text.includes("TRIGGER_VERIFY")) {
+      if (agyLog) fs.appendFileSync(agyLog, '2026/11/17 12:00:00 ERROR validation_url="https://accounts.google.com/signin/continue?s=abc\\u0026t=1"\\n');
+      reply = "\\n⚠ Verification Required\\n";
+    } else if (text.includes("QUOTE_BOTH")) {
+      reply = "Saw ⚠ Verification Required and ⚠ Individual quota reached in log.";
+    }
+    send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: reply } } } });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  }
+});
+`)
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = convDir
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  try {
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-qv=${Date.now()}`)
+    const plugin = await AntigravityBridgePlugin()
+    const loader = await plugin.auth.loader()
+
+    const quotaRes = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: `u-qv-${++count}` }, messages: [{ role: "user", content: "TRIGGER_QUOTA" }] }),
+    })
+    const quotaBody = await quotaRes.json()
+    assert.equal(quotaRes.status, 429, JSON.stringify(quotaBody))
+    assert.equal(quotaBody.error?.type, "rate_limit_error")
+    assert.equal(quotaBody.error?.code, "AGY_ERROR_QUOTA_EXHAUSTED")
+    assert.match(quotaBody.error?.message || "", /Resets in 1h18m40s/)
+
+    const verifyRes = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: `u-qv-${++count}` }, messages: [{ role: "user", content: "TRIGGER_VERIFY" }] }),
+    })
+    const verifyBody = await verifyRes.json()
+    assert.equal(verifyRes.status, 403, JSON.stringify(verifyBody))
+    assert.equal(verifyRes.headers.get("x-should-retry"), "false")
+    assert.equal(verifyBody.error?.type, "permission_error")
+    assert.equal(verifyBody.error?.code, "AGY_ERROR_FORBIDDEN")
+    assert.match(verifyBody.error?.message || "", /this Google account needs to be verified/)
+    assert.match(verifyBody.error?.message || "", /https:\/\/accounts\.google\.com\/signin\/continue\?s=abc&t=1/)
+
+    const quotedRes = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: `u-qv-${++count}` }, messages: [{ role: "user", content: "QUOTE_BOTH" }] }),
+    })
+    const quotedBody = await quotedRes.json()
+    assert.equal(quotedRes.status, 200, JSON.stringify(quotedBody))
+    assert.match(quotedBody.content?.[0]?.text || "", /⚠ Verification Required/)
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
+
+
+test("unlisted initial tools fail with 502 tools_not_loaded and a no-watcher session is replaced when tools arrive", async () => {
+  const convDir = path.join(root, "conv-unlisted")
+  const accountsDir = path.join(root, "accounts-unlisted")
+  const stateFile = path.join(root, "state-unlisted.json")
+  const fakeDir = path.join(root, "fake-unlisted-agy")
+  fs.mkdirSync(convDir, { recursive: true })
+  fs.mkdirSync(accountsDir, { recursive: true })
+  const markerFile = path.join(root, "unlisted-connect-mcp")
+  const fakeBin = writeFakeAgy(fakeDir, `
+import fs from "node:fs";
+import net from "node:net";
+import readline from "node:readline";
+const args = process.argv.slice(2);
+if (args.includes("--help")) process.exit(0);
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
+let count = 0;
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+function watchTools() {
+  return new Promise((resolve, reject) => {
+    const port = Number(process.env.AGY_BRIDGE_CONTROL_PORT);
+    const token = process.env.AGY_BRIDGE_TOKEN;
+    const watch = net.createConnection({ host: "127.0.0.1", port }, () => {
+      watch.write(JSON.stringify({ token, kind: "watch" }) + "\\n");
+    });
+    watch.unref();
+    const sock = net.createConnection({ host: "127.0.0.1", port }, () => {
+      sock.write(JSON.stringify({ token, kind: "list" }) + "\\n");
+    });
+    let buf = "";
+    sock.on("data", chunk => {
+      buf += chunk.toString("utf8");
+      const nl = buf.indexOf("\\n");
+      if (nl < 0) return;
+      resolve(JSON.parse(buf.slice(0, nl)));
+      sock.destroy();
+    });
+    sock.on("error", reject);
+  });
+}
+readline.createInterface({ input: process.stdin }).on("line", async line => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } }, agentInfo: { name: "fake-agy", version: "1.5.9" } } });
+  } else if (msg.method === "session/new") {
+    count++;
+    if (fs.existsSync(${JSON.stringify(markerFile)})) await watchTools();
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-unl-" + count + "-" + process.pid } });
+  } else if (msg.method === "session/set_model" || msg.method === "session/set_config_option") {
+    send({ jsonrpc: "2.0", id: msg.id, result: {} });
+  } else if (msg.method === "session/prompt") {
+    const sid = msg.params?.sessionId;
+    send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok:" + sid } } } });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  }
+});
+`)
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+    AGY_BRIDGE_TOOL_LIST_WAIT_MS: process.env.AGY_BRIDGE_TOOL_LIST_WAIT_MS,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = convDir
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  process.env.AGY_BRIDGE_TOOL_LIST_WAIT_MS = "150"
+  const tools = [{ name: "echo", input_schema: { type: "object", properties: { text: { type: "string" } } } }]
+  try {
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-unl=${Date.now()}`)
+    const plugin = await AntigravityBridgePlugin()
+    const loader = await plugin.auth.loader()
+
+    const failRes = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, tools, metadata: { user_id: "u-unl-1" }, messages: [{ role: "user", content: "need tools" }] }),
+    })
+    const failBody = await failRes.json()
+    assert.equal(failRes.status, 502, JSON.stringify(failBody))
+    assert.equal(failBody.error?.code, "tools_not_loaded")
+
+    // First turn starts without tools (and fake agy didn't connect MCP), second turn brings tools -> replaces session cleanly.
+    const r1 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: "u-unl-2" }, messages: [{ role: "user", content: "no tools yet" }] }),
+    })
+    const b1 = await r1.json()
+    assert.equal(r1.status, 200, JSON.stringify(b1))
+    fs.writeFileSync(markerFile, "1")
+    const r2 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        tools,
+        metadata: { user_id: "u-unl-2" },
+        messages: [
+          { role: "user", content: "no tools yet" },
+          { role: "assistant", content: b1.content },
+          { role: "user", content: "now with tools" },
+        ],
+      }),
+    })
+    const b2 = await r2.json()
+    assert.equal(r2.status, 200, JSON.stringify(b2))
+    assert.notEqual(b1.content?.[0]?.text, b2.content?.[0]?.text)
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
+
+
+test("agy launch flags probe --help once per binary for --settings, --include-default-customizations=false, and --disable-telemetry", async () => {
+  const convDir = path.join(root, "conv-flags")
+  const accountsDir = path.join(root, "accounts-flags")
+  const stateFile = path.join(root, "state-flags.json")
+  const fakeDir = path.join(root, "fake-flags-agy")
+  const logFile = path.join(root, "flags.jsonl")
+  fs.mkdirSync(convDir, { recursive: true })
+  fs.mkdirSync(accountsDir, { recursive: true })
+  const fakeBin = writeFakeAgy(fakeDir, `
+import fs from "node:fs";
+import readline from "node:readline";
+const args = process.argv.slice(2);
+const log = (entry) => fs.appendFileSync(${JSON.stringify(logFile)}, JSON.stringify(entry) + "\\n");
+if (args.length === 1 && args[0] === "--help") {
+  log({ type: "top-help" });
+  console.log("Usage:\\n  --settings string   override settings");
+  process.exit(0);
+}
+if (args[0] === "acp" && args.includes("--help")) {
+  log({ type: "acp-help" });
+  console.log("Usage of acp:\\n  --include-default-customizations\\n  --disable-telemetry");
+  process.exit(0);
+}
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+if (args.includes("models")) {
+  log({ type: "models", args });
+  console.log("gemini-test  Gemini Test");
+  process.exit(0);
+}
+log({ type: "acp", args });
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+readline.createInterface({ input: process.stdin }).on("line", line => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } }, agentInfo: { name: "fake-agy", version: "1.5.9" } } });
+  else if (msg.method === "session/new") send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-flags" } });
+  else if (msg.method === "session/set_model" || msg.method === "session/set_config_option") send({ jsonrpc: "2.0", id: msg.id, result: {} });
+  else if (msg.method === "session/prompt") {
+    send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: msg.params?.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } } } });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  }
+});
+`)
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+    AGY_BRIDGE_TELEMETRY: process.env.AGY_BRIDGE_TELEMETRY,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = convDir
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  delete process.env.AGY_BRIDGE_TELEMETRY
+  try {
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-flags=${Date.now()}`)
+    const plugin = await AntigravityBridgePlugin()
+    const loader = await plugin.auth.loader()
+    const r1 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: "u-flags-1" }, messages: [{ role: "user", content: "hi" }] }),
+    })
+    assert.equal(r1.status, 200)
+    process.env.AGY_BRIDGE_TELEMETRY = "1"
+    const r2 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: "u-flags-2" }, messages: [{ role: "user", content: "hi2" }] }),
+    })
+    assert.equal(r2.status, 200)
+    const events = fs.readFileSync(logFile, "utf8").trim().split("\n").map(JSON.parse)
+    assert.equal(events.filter(e => e.type === "top-help").length, 1)
+    assert.equal(events.filter(e => e.type === "acp-help").length, 1)
+    const modelsCall = events.find(e => e.type === "models")
+    assert.deepEqual(modelsCall.args, ["--settings", JSON.stringify({ modelProvider: "" }), "models"])
+    const acpCalls = events.filter(e => e.type === "acp")
+    assert.equal(acpCalls.length, 2)
+    assert.ok(acpCalls[0].args.includes("--include-default-customizations=false"))
+    assert.ok(acpCalls[0].args.includes("--disable-telemetry"))
+    assert.ok(acpCalls[1].args.includes("--include-default-customizations=false"))
+    assert.ok(!acpCalls[1].args.includes("--disable-telemetry"))
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
+
+
+test("x-magpie-session/subagent headers isolate sessions and Request.text() body fallback works when init.body is omitted", async () => {
+  const convDir = path.join(root, "conv-scope")
+  const accountsDir = path.join(root, "accounts-scope")
+  const stateFile = path.join(root, "state-scope.json")
+  const fakeDir = path.join(root, "fake-scope-agy")
+  fs.mkdirSync(convDir, { recursive: true })
+  fs.mkdirSync(accountsDir, { recursive: true })
+  const fakeBin = writeFakeAgy(fakeDir, `
+import readline from "node:readline";
+const args = process.argv.slice(2);
+if (args.includes("--help")) process.exit(0);
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
+let count = 0;
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+readline.createInterface({ input: process.stdin }).on("line", line => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } }, agentInfo: { name: "fake-agy", version: "1.5.9" } } });
+  else if (msg.method === "session/new") send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-scope-" + (++count) + "-" + process.pid } });
+  else if (msg.method === "session/set_model" || msg.method === "session/set_config_option") send({ jsonrpc: "2.0", id: msg.id, result: {} });
+  else if (msg.method === "session/prompt") {
+    const sid = msg.params?.sessionId;
+    send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "sid:" + sid } } } });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  }
+});
+`)
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = convDir
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  try {
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-scope=${Date.now()}`)
+    const plugin = await AntigravityBridgePlugin()
+    const loader = await plugin.auth.loader()
+    const payload = { model: "gemini-test", stream: false, messages: [{ role: "user", content: "same opening" }] }
+    const rA = await loader.fetch(new Request("http://local/messages", {
+      method: "POST",
+      headers: { "x-magpie-session": "sess-alpha" },
+      body: JSON.stringify(payload),
+    }))
+    const bA = await rA.json()
+    assert.equal(rA.status, 200, JSON.stringify(bA))
+    const rB = await loader.fetch(new Request("http://local/messages", {
+      method: "POST",
+      headers: { "x-magpie-session": "sess-beta", "x-magpie-subagent": "reviewer" },
+      body: JSON.stringify(payload),
+    }))
+    const bB = await rB.json()
+    assert.equal(rB.status, 200, JSON.stringify(bB))
+    assert.notEqual(bA.content?.[0]?.text, bB.content?.[0]?.text)
+    const rA2 = await loader.fetch(new Request("http://local/messages", {
+      method: "POST",
+      headers: { "x-magpie-session": "sess-alpha" },
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        messages: [
+          { role: "user", content: "same opening" },
+          { role: "assistant", content: bA.content },
+          { role: "user", content: "alpha follow up" },
+        ],
+      }),
+    }))
+    const bA2 = await rA2.json()
+    assert.equal(rA2.status, 200, JSON.stringify(bA2))
+    assert.equal(bA2.content?.[0]?.text, bA.content?.[0]?.text)
+
+    // Ephemeral magpie-<24hex> session IDs are ignored so they still reuse the same un-scoped session.
+    const rM1 = await loader.fetch(new Request("http://local/messages", {
+      method: "POST",
+      headers: { "x-magpie-session": "magpie-0123456789abcdef01234567" },
+      body: JSON.stringify({ model: "gemini-test", stream: false, messages: [{ role: "user", content: "ephemeral id test" }] }),
+    }))
+    const bM1 = await rM1.json()
+    const rM2 = await loader.fetch(new Request("http://local/messages", {
+      method: "POST",
+      headers: { "x-magpie-session": "magpie-fedcba9876543210fedcba98" },
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        messages: [
+          { role: "user", content: "ephemeral id test" },
+          { role: "assistant", content: bM1.content },
+          { role: "user", content: "follow up" },
+        ],
+      }),
+    }))
+    const bM2 = await rM2.json()
+    assert.equal(rM2.status, 200, JSON.stringify(bM2))
+    assert.equal(bM1.content?.[0]?.text, bM2.content?.[0]?.text)
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
+
+
+test("tool state machine handles foldSplitCalls, movedOnVerdict, droppedPendingCalls, carriedAnswered, and thinking prefill", async () => {
+  const convDir = path.join(root, "conv-tsm")
+  const accountsDir = path.join(root, "accounts-tsm")
+  const stateFile = path.join(root, "state-tsm.json")
+  const fakeDir = path.join(root, "fake-tsm-agy")
+  fs.mkdirSync(convDir, { recursive: true })
+  fs.mkdirSync(accountsDir, { recursive: true })
+  const fakeBin = writeFakeAgy(fakeDir, `
+import net from "node:net";
+import readline from "node:readline";
+const args = process.argv.slice(2);
+if (args.includes("--help")) process.exit(0);
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
+let count = 0;
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+function mcpCall(name, input) {
+  return new Promise((resolve, reject) => {
+    const port = Number(process.env.AGY_BRIDGE_CONTROL_PORT);
+    const token = process.env.AGY_BRIDGE_TOKEN;
+    const sock = net.createConnection({ host: "127.0.0.1", port }, () => {
+      sock.write(JSON.stringify({ token, kind: "call", name, input }) + "\\n");
+    });
+    let buf = "";
+    sock.on("data", chunk => {
+      buf += chunk.toString("utf8");
+      const nl = buf.indexOf("\\n");
+      if (nl < 0) return;
+      resolve(JSON.parse(buf.slice(0, nl)));
+      sock.destroy();
+    });
+    sock.on("error", reject);
+  });
+}
+function watchTools() {
+  return new Promise((resolve, reject) => {
+    const port = Number(process.env.AGY_BRIDGE_CONTROL_PORT);
+    const token = process.env.AGY_BRIDGE_TOKEN;
+    const watch = net.createConnection({ host: "127.0.0.1", port }, () => {
+      watch.write(JSON.stringify({ token, kind: "watch" }) + "\\n");
+    });
+    watch.unref();
+    const sock = net.createConnection({ host: "127.0.0.1", port }, () => {
+      sock.write(JSON.stringify({ token, kind: "list" }) + "\\n");
+    });
+    let buf = "";
+    sock.on("data", chunk => {
+      buf += chunk.toString("utf8");
+      const nl = buf.indexOf("\\n");
+      if (nl < 0) return;
+      resolve(JSON.parse(buf.slice(0, nl)));
+      sock.destroy();
+    });
+    sock.on("error", reject);
+  });
+}
+let activeSid = null;
+let cancelPrompt = null;
+readline.createInterface({ input: process.stdin }).on("line", async line => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } }, agentInfo: { name: "fake-agy", version: "1.5.9" } } });
+  } else if (msg.method === "session/new") {
+    await watchTools();
+    activeSid = "s-tsm-" + (++count) + "-" + process.pid;
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: activeSid } });
+  } else if (msg.method === "session/set_model" || msg.method === "session/set_config_option") {
+    send({ jsonrpc: "2.0", id: msg.id, result: {} });
+  } else if (msg.method === "session/cancel") {
+    cancelPrompt?.();
+  } else if (msg.method === "session/prompt") {
+    const sid = msg.params?.sessionId;
+    const text = (msg.params?.prompt || []).map(p => p.text || "").join("\\n");
+    if (text.includes("START_SPLIT") && !text.includes("<conversation_history>")) {
+      const r = await mcpCall("batch_read", { paths: ["a.txt", "b.txt"] });
+      const resText = (r.result?.content || []).map(p => p.text || "").join("|");
+      send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "split:" + sid + ":" + resText } } } });
+      send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+    } else if (text.includes("START_DROP") && !text.includes("<conversation_history>")) {
+      send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "partial:" + sid } } } });
+      const mcpPromise = mcpCall("batch_read", { paths: ["x.txt"] });
+      const cancelled = await new Promise(resolve => {
+        cancelPrompt = () => resolve(true);
+        mcpPromise.then(() => {});
+      });
+      cancelPrompt = null;
+      await mcpPromise;
+      send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: cancelled ? "cancelled" : "end_turn" } });
+    } else if (text.includes("START_DUAL") && !text.includes("<conversation_history>")) {
+      const open = (paths) => new Promise((resolve, reject) => {
+        const port = Number(process.env.AGY_BRIDGE_CONTROL_PORT);
+        const sock = net.createConnection({ host: "127.0.0.1", port }, () => resolve({ sock, paths }));
+        sock.on("error", reject);
+      });
+      const conns = await Promise.all([open(["1"]), open(["2"])]);
+      const token = process.env.AGY_BRIDGE_TOKEN;
+      await Promise.all(conns.map(({ sock, paths }) => new Promise((resolve, reject) => {
+        let buf = "";
+        sock.on("data", chunk => { buf += chunk; const nl = buf.indexOf("\\n"); if (nl >= 0) { resolve(JSON.parse(buf.slice(0, nl))); sock.destroy(); } });
+        sock.on("error", reject);
+        sock.write(JSON.stringify({ token, kind: "call", name: "batch_read", input: { paths } }) + "\\n");
+      })));
+      send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+    } else {
+      send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok:" + sid } } } });
+      send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+    }
+  }
+});
+`)
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = convDir
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  const tools = [{ name: "batch_read", input_schema: { type: "object", properties: { paths: { type: "array", items: { type: "string" } } } } }]
+  try {
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-tsm=${Date.now()}`)
+    const plugin = await AntigravityBridgePlugin()
+    const loader = await plugin.auth.loader()
+
+    // 1. foldSplitCalls: split Hermes tool_use + tool_results fold back into the live MCP call.
+    const rSplit1 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, tools, metadata: { user_id: "u-split" }, messages: [{ role: "user", content: "START_SPLIT" }] }),
+    })
+    const bSplit1 = await rSplit1.json()
+    const splitUse = bSplit1.content.find(b => b.type === "tool_use")
+    assert.ok(splitUse)
+    const rSplit2 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        tools,
+        metadata: { user_id: "u-split" },
+        messages: [
+          { role: "user", content: "START_SPLIT" },
+          { role: "assistant", content: [
+            { type: "tool_use", id: splitUse.id, name: "batch_read", input: { paths: ["a.txt"] } },
+            { type: "tool_use", id: "call_hermes_2", name: "batch_read", input: { paths: ["b.txt"] } },
+          ] },
+          { role: "user", content: [
+            { type: "tool_result", tool_use_id: splitUse.id, content: "A" },
+            { type: "tool_result", tool_use_id: "call_hermes_2", content: "B" },
+          ] },
+        ],
+      }),
+    })
+    const bSplit2 = await rSplit2.json()
+    assert.equal(rSplit2.status, 200, JSON.stringify(bSplit2))
+    assert.match(bSplit2.content?.[0]?.text || "", /^split:s-tsm-.*:A\|B$/)
+
+    // 2. droppedPendingCalls + keepDroppedTurn keeps the same live session when pending tool_use is dropped.
+    const rDrop1 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, tools, metadata: { user_id: "u-drop" }, messages: [{ role: "user", content: "START_DROP" }] }),
+    })
+    const bDrop1 = await rDrop1.json()
+    assert.equal(bDrop1.stop_reason, "tool_use")
+    const dropPartial = bDrop1.content.find(b => b.type === "text")?.text || ""
+    const dropSid = dropPartial.replace(/^partial:/, "")
+    const rDrop2 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        tools,
+        metadata: { user_id: "u-drop" },
+        messages: [
+          { role: "user", content: "START_DROP" },
+          { role: "assistant", content: [{ type: "text", text: dropPartial }] },
+          { role: "user", content: "continue without tool" },
+        ],
+      }),
+    })
+    const bDrop2 = await rDrop2.json()
+    assert.equal(rDrop2.status, 200, JSON.stringify(bDrop2))
+    assert.equal(bDrop2.content?.[0]?.text, "ok:" + dropSid)
+
+    // 3. movedOnVerdict replays immediately on first unmatched result after another provider's tool call.
+    const rMove1 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, tools, metadata: { user_id: "u-move" }, messages: [{ role: "user", content: "START_DROP" }] }),
+    })
+    const bMove1 = await rMove1.json()
+    const moveUse = bMove1.content.find(b => b.type === "tool_use")
+    const rMove2 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        tools,
+        metadata: { user_id: "u-move" },
+        messages: [
+          { role: "user", content: "START_DROP" },
+          { role: "assistant", content: bMove1.content },
+          { role: "user", content: "try another" },
+          { role: "assistant", content: [{ type: "tool_use", id: "call_other_provider_1", name: "batch_read", input: { paths: ["y.txt"] } }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "call_other_provider_1", content: "Y" }] },
+        ],
+      }),
+    })
+    const bMove2 = await rMove2.json()
+    assert.equal(rMove2.status, 200, JSON.stringify(bMove2))
+    assert.match(bMove2.content?.[0]?.text || "", /^ok:s-tsm-/)
+
+    // 4. carriedAnswered supersedes cleanly when a carried subset is answered in history, and assistantTextOf skips thinking blocks.
+    const rCar1 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, tools, metadata: { user_id: "u-car" }, messages: [{ role: "user", content: "START_DUAL" }] }),
+    })
+    const bCar1 = await rCar1.json()
+    const dualUses = bCar1.content.filter(b => b.type === "tool_use")
+    assert.ok(dualUses.length >= 1)
+    const rCar2 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        tools,
+        metadata: { user_id: "u-car" },
+        messages: [
+          { role: "user", content: "START_DUAL" },
+          { role: "assistant", content: [dualUses[0]] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: dualUses[0].id, content: "only first" }] },
+          { role: "user", content: "move on without second call" },
+        ],
+      }),
+    })
+    const bCar2 = await rCar2.json()
+    assert.equal(rCar2.status, 200, JSON.stringify(bCar2))
+
+    // 5. assistantTextOf skips thinking/redacted_thinking blocks in prefill tail.
+    const rPrefill = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        metadata: { user_id: "u-prefill-think" },
+        messages: [
+          { role: "user", content: "start" },
+          { role: "assistant", content: [{ type: "thinking", thinking: "internal" }, { type: "redacted_thinking", data: "x" }, { type: "text", text: "Answer: " }] },
+        ],
+      }),
+    })
+    const bPrefill = await rPrefill.json()
+    assert.equal(rPrefill.status, 200, JSON.stringify(bPrefill))
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
+
+
+test("sign-in guard checks named accounts, #setModel classifies 401/503/400, and agy models timeout is 45s+", async () => {
+  const caseRoot = path.join(root, "stabilize-13a")
+  const accountsDir = path.join(caseRoot, "accounts")
+  const convDir = path.join(caseRoot, "convs")
+  const stateFile = path.join(caseRoot, "state.json")
+  const badAccDir = path.join(accountsDir, "badacc")
+  const emptyAccDir = path.join(accountsDir, "emptyacc")
+  fs.mkdirSync(path.join(badAccDir, "antigravity-cli"), { recursive: true })
+  fs.writeFileSync(
+    path.join(badAccDir, "antigravity-cli", "antigravity-oauth-token"),
+    JSON.stringify({ token: { access_token: "stale-token", expiry: "2020-01-01T00:00:00Z" } }),
+  )
+  fs.mkdirSync(path.join(emptyAccDir, "antigravity-cli"), { recursive: true })
+  fs.writeFileSync(
+    path.join(emptyAccDir, "antigravity-cli", "antigravity-oauth-token"),
+    JSON.stringify({ token: { access_token: "ok-token", expiry: new Date(Date.now() + 3600_000).toISOString() } }),
+  )
+
+  const modeFile = path.join(caseRoot, "mode.txt")
+  const acpLog = path.join(caseRoot, "acp-spawns.txt")
+  fs.writeFileSync(modeFile, "empty-catalog")
+  fs.writeFileSync(acpLog, "")
+
+  const fakeDir = path.join(caseRoot, "bin")
+  const fakeBin = writeFakeAgy(fakeDir, `
+import fs from "node:fs";
+import readline from "node:readline";
+const args = process.argv.slice(2);
+if (args.includes("--help")) process.exit(0);
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+const mode = fs.readFileSync(${JSON.stringify(modeFile)}, "utf8").trim();
+if (args.includes("models")) {
+  if (mode === "slow-models") {
+    setTimeout(() => { console.log("gemini-test  Gemini Test"); process.exit(0); }, 220);
+  } else {
+    console.log("gemini-test  Gemini Test");
+    process.exit(0);
+  }
+} else {
+  fs.appendFileSync(${JSON.stringify(acpLog)}, mode + "\\n");
+  const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+  readline.createInterface({ input: process.stdin }).on("line", line => {
+    const msg = JSON.parse(line);
+    if (msg.method === "initialize") {
+      send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } }, agentInfo: { name: "fake-agy", version: "1.5.9" } } });
+    } else if (msg.method === "session/new") {
+      if (mode === "empty-catalog") {
+        send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-empty" } });
+      } else {
+        send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-nonempty", models: { availableModels: [{ modelId: "gemini-test", name: "Gemini Test" }] } } });
+      }
+    } else if (msg.method === "session/set_model" || msg.method === "session/set_config_option") {
+      if (mode === "empty-catalog") {
+        send({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "Model not found" } });
+      } else if (mode === "setmodel-unauth") {
+        send({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: "not logged in" } });
+      } else if (mode === "setmodel-bad") {
+        send({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "Unknown model ID" } });
+      } else {
+        send({ jsonrpc: "2.0", id: msg.id, result: {} });
+      }
+    }
+  });
+}
+`)
+
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+    AGY_BRIDGE_STORED_SIGNIN: process.env.AGY_BRIDGE_STORED_SIGNIN,
+    AGY_BRIDGE_DISABLE_KEYCHAIN: process.env.AGY_BRIDGE_DISABLE_KEYCHAIN,
+    AGY_BRIDGE_MODELS_TIMEOUT_MS: process.env.AGY_BRIDGE_MODELS_TIMEOUT_MS,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = convDir
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  process.env.AGY_BRIDGE_DISABLE_KEYCHAIN = "1"
+
+  try {
+    // 1. Named account without token fails fast with 401 + X-Magpie-Sign-In: expired before spawning agy.
+    delete process.env.AGY_BRIDGE_STORED_SIGNIN
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-13a=${Date.now()}`)
+    const pluginBad = await AntigravityBridgePlugin({ magpie: true }, { contextPort: 0 })
+    const loaderBad = await pluginBad.auth.loader(async () => ({ type: "api", key: "agy:badacc" }))
+    const resUnauth = await loaderBad.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, messages: [{ role: "user", content: "hi" }] }),
+    })
+    const bodyUnauth = await resUnauth.json()
+    assert.equal(resUnauth.status, 401, JSON.stringify(bodyUnauth))
+    assert.equal(bodyUnauth.error?.code, "unauthenticated")
+    assert.equal(resUnauth.headers.get("x-magpie-sign-in"), "expired")
+    assert.equal(fs.readFileSync(acpLog, "utf8"), "", "must reject before spawning ACP")
+
+    // 2. Empty offered models on session/new + session/set_model rejection -> 503 empty_model_catalog (not 400).
+    process.env.AGY_BRIDGE_STORED_SIGNIN = "skip"
+    fs.writeFileSync(modeFile, "empty-catalog")
+    const plugin = await AntigravityBridgePlugin({ magpie: true }, { contextPort: 0 })
+    const loader = await plugin.auth.loader(async () => ({ type: "api", key: "agy:emptyacc" }))
+    const resEmpty = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: "u-empty" }, messages: [{ role: "user", content: "hi" }] }),
+    })
+    const bodyEmpty = await resEmpty.json()
+    assert.equal(resEmpty.status, 503, JSON.stringify(bodyEmpty))
+    assert.equal(bodyEmpty.error?.code, "empty_model_catalog")
+
+    // 3. Non-empty offered models + auth error on session/set_model -> 401 unauthenticated + X-Magpie-Sign-In: expired.
+    fs.writeFileSync(modeFile, "setmodel-unauth")
+    const resSetUnauth = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: "u-setunauth" }, messages: [{ role: "user", content: "hi" }] }),
+    })
+    const bodySetUnauth = await resSetUnauth.json()
+    assert.equal(resSetUnauth.status, 401, JSON.stringify(bodySetUnauth))
+    assert.equal(bodySetUnauth.error?.code, "unauthenticated")
+    assert.equal(resSetUnauth.headers.get("x-magpie-sign-in"), "expired")
+    assert.equal(resSetUnauth.headers.get("x-should-retry"), "false")
+
+    // 4. Non-empty offered models + non-auth error on session/set_model -> 400 unavailable.
+    fs.writeFileSync(modeFile, "setmodel-bad")
+    const resBadModel = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: "u-badmodel" }, messages: [{ role: "user", content: "hi" }] }),
+    })
+    const bodyBadModel = await resBadModel.json()
+    assert.equal(resBadModel.status, 400, JSON.stringify(bodyBadModel))
+
+    // 5. AGY_BRIDGE_MODELS_TIMEOUT_MS configures models probe deadline; default (45s) succeeds when 220ms slow.
+    fs.writeFileSync(modeFile, "slow-models")
+    const savedMethod = plugin.auth.methods.findLast(m => m.prompts?.some(p => p.key === "name"))
+    assert.ok(savedMethod)
+    process.env.AGY_BRIDGE_MODELS_TIMEOUT_MS = "50"
+    const timedOutAuth = await savedMethod.authorize({ name: "emptyacc" })
+    assert.equal(timedOutAuth.type, "failed")
+    delete process.env.AGY_BRIDGE_MODELS_TIMEOUT_MS
+    const okAuth = await savedMethod.authorize({ name: "emptyacc" })
+    assert.equal(okAuth.type, "success", JSON.stringify(okAuth))
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
+
+
+test("oversized system prompts auto-offload to _meta.antigravity.systemPrompt.append while small prompts stay inline", async () => {
+  const caseRoot = path.join(root, "auto-system-append-13b")
+  const accountsDir = path.join(caseRoot, "accounts")
+  const convDir = path.join(caseRoot, "convs")
+  const stateFile = path.join(caseRoot, "state.json")
+  const logFile = path.join(caseRoot, "events.jsonl")
+  fs.mkdirSync(convDir, { recursive: true })
+  fs.writeFileSync(logFile, "")
+
+  const fakeDir = path.join(caseRoot, "bin")
+  const fakeBin = writeFakeAgy(fakeDir, `
+import fs from "node:fs";
+import readline from "node:readline";
+const args = process.argv.slice(2);
+if (args.includes("--help")) process.exit(0);
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
+const logPath = ${JSON.stringify(logFile)};
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+let count = 0;
+readline.createInterface({ input: process.stdin }).on("line", line => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {
+        protocolVersion: 1,
+        agentCapabilities: {
+          promptCapabilities: { image: true },
+          _meta: { antigravity: { systemPrompt: { append: true } } },
+        },
+        agentInfo: { name: "fake-agy", version: "1.5.9" },
+      },
+    });
+  } else if (msg.method === "session/new") {
+    const sid = "s-app-" + (++count);
+    fs.appendFileSync(logPath, JSON.stringify({
+      type: "new",
+      sid,
+      append: msg.params?._meta?.antigravity?.systemPrompt?.append ?? null,
+    }) + "\\n");
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: sid } });
+  } else if (msg.method === "session/set_model" || msg.method === "session/set_config_option") {
+    send({ jsonrpc: "2.0", id: msg.id, result: {} });
+  } else if (msg.method === "session/prompt") {
+    const sid = msg.params?.sessionId;
+    const text = (msg.params?.prompt || []).map(p => p.text || "").join("\\n");
+    fs.appendFileSync(logPath, JSON.stringify({
+      type: "prompt",
+      sid,
+      bytes: Buffer.byteLength(text, "utf8"),
+      hasInlineSystem: text.includes("<external_system_instructions>"),
+    }) + "\\n");
+    send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok:" + sid } } } });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  }
+});
+`)
+
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+    AGY_BRIDGE_SYSTEM_APPEND: process.env.AGY_BRIDGE_SYSTEM_APPEND,
+    AGY_BRIDGE_UNLOCKED: process.env.AGY_BRIDGE_UNLOCKED,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = convDir
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  delete process.env.AGY_BRIDGE_SYSTEM_APPEND
+  delete process.env.AGY_BRIDGE_UNLOCKED
+
+  try {
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-13b=${Date.now()}`)
+    const plugin = await AntigravityBridgePlugin()
+    const loader = await plugin.auth.loader()
+
+    // 1. Small system prompt stays inline when AGY_BRIDGE_SYSTEM_APPEND is unset.
+    const rSmall = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        system: "You are concise.",
+        metadata: { user_id: "u-small-sys" },
+        messages: [{ role: "user", content: "hello small" }],
+      }),
+    })
+    const bSmall = await rSmall.json()
+    assert.equal(rSmall.status, 200, JSON.stringify(bSmall))
+
+    // 2. Oversized 190 KB system prompt auto-offloads into _meta.antigravity.systemPrompt.append, bypassing the 180 KB user limit.
+    const largeSystem = "LARGE_SYS_MARKER_" + "S".repeat(190_000)
+    const rLarge = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        system: largeSystem,
+        metadata: { user_id: "u-large-sys" },
+        messages: [{ role: "user", content: "hello large" }],
+      }),
+    })
+    const bLarge = await rLarge.json()
+    assert.equal(rLarge.status, 200, JSON.stringify(bLarge))
+
+    const events = fs.readFileSync(logFile, "utf8").trim().split("\n").filter(Boolean).map(l => JSON.parse(l))
+    const newEvents = events.filter(e => e.type === "new")
+    const promptEvents = events.filter(e => e.type === "prompt")
+    assert.equal(newEvents[0]?.append, null)
+    assert.equal(promptEvents[0]?.hasInlineSystem, true)
+    assert.ok(typeof newEvents[1]?.append === "string" && newEvents[1].append.includes("LARGE_SYS_MARKER_"))
+    assert.equal(Buffer.byteLength(newEvents[1].append, "utf8") > 190_000, true)
+    assert.equal(promptEvents[1]?.hasInlineSystem, false)
+    assert.ok(promptEvents[1]?.bytes < 1000)
+
+    // 3. Explicit AGY_BRIDGE_SYSTEM_APPEND=0 disables auto-offload and rejects the 190 KB inline prompt cleanly with 400.
+    process.env.AGY_BRIDGE_SYSTEM_APPEND = "0"
+    const rDisabled = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        system: largeSystem,
+        metadata: { user_id: "u-large-disabled" },
+        messages: [{ role: "user", content: "hello disabled" }],
+      }),
+    })
+    const bDisabled = await rDisabled.json()
+    assert.equal(rDisabled.status, 400, JSON.stringify(bDisabled))
   } finally {
     for (const [k, v] of Object.entries(prev)) {
       if (v === undefined) delete process.env[k]

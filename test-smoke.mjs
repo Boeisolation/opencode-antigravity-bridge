@@ -41,6 +41,7 @@ const argv = process.argv.slice(2)
 const log = value => fs.appendFileSync(process.env.FAKE_AGY_LOG, JSON.stringify(value) + "\n")
 const send = value => process.stdout.write(JSON.stringify(value) + "\n")
 
+if (argv.includes("--help")) process.exit(0)
 if (argv.includes("--version")) {
   process.stdout.write("1.5.0\n")
   process.exit(0)
