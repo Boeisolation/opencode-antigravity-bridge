@@ -81,18 +81,25 @@ export function emailOf(raw) {
   return typeof email === "string" ? email.trim().slice(0, 200) : ""
 }
 
-export async function readAccountSignIn(geminiDir, { now = Date.now(), env = process.env } = {}) {
+async function readAccountValue(geminiDir, { env = process.env, platform = process.platform } = {}) {
   if (env.AGY_BRIDGE_STORED_SIGNIN === "skip") return { state: "unknown" }
   if (ENV_SIGN_INS.some((name) => env[name])) return { state: "unknown" }
-  if (!geminiDir) return readStoredSignIn({ now, env })
+  // Windows-to-WSL mode signs in inside the distro; never read host profile tokens.
+  if (wslDistro(env, platform)) return { state: "unknown" }
   const file = path.join(geminiDir, "antigravity-cli", "antigravity-oauth-token")
   try {
-    const raw = await fs.promises.readFile(file, "utf8")
-    return parseStored(raw, now)
+    return { raw: await fs.promises.readFile(file, "utf8") }
   } catch (error) {
-    if (error?.code === "ENOENT") return { state: "missing" }
-    return { state: "unknown" }
+    return { state: error?.code === "ENOENT" ? "missing" : "unknown" }
   }
+}
+
+export async function readAccountSignIn(geminiDir, { now = Date.now(), env = process.env, platform = process.platform } = {}) {
+  if (env.AGY_BRIDGE_STORED_SIGNIN === "skip") return { state: "unknown" }
+  if (ENV_SIGN_INS.some((name) => env[name])) return { state: "unknown" }
+  if (!geminiDir) return readStoredSignIn({ now, env, platform })
+  const value = await readAccountValue(geminiDir, { env, platform })
+  return "raw" in value ? parseStored(value.raw, now) : value
 }
 
 async function readStoredValue({ platform = process.platform, exec = run, env = process.env } = {}) {
@@ -122,6 +129,19 @@ async function readStoredValue({ platform = process.platform, exec = run, env = 
 export async function readStoredSignIn({ now = Date.now(), ...opts } = {}) {
   const value = await readStoredValue(opts)
   return "raw" in value ? parseStored(value.raw, now) : value
+}
+
+// Read-only credential access for usage.mjs direct quota queries; never writes back.
+export async function storedToken(opts = {}) {
+  try {
+    const dir = opts?.geminiDir ?? opts?.dir
+    const value = dir ? await readAccountValue(dir, opts) : await readStoredValue(opts)
+    if (!("raw" in value)) return null
+    const stored = decodeStored(value.raw)
+    return stored?.token && typeof stored.token === "object" ? stored : null
+  } catch {
+    return null
+  }
 }
 
 export async function storedEmail(opts) {
