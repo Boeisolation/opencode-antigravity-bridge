@@ -312,15 +312,20 @@ test("account probes share in-flight work, cache failures, time out and clean wo
   try {
     globalThis.setTimeout = (callback, delay, ...args) => {
       delays.push(delay)
-      return originalTimer(callback, delay === 5000 ? 20 : delay, ...args)
+      return originalTimer(callback, delay === 15000 ? 20 : delay, ...args)
     }
     childProcess.spawn = (file, args, options) => {
-      const record = { file, args, options, methods: [], ended: false }
-      calls.push(record)
       const child = new EventEmitter()
       child.stdin = new PassThrough()
       child.stdout = new PassThrough()
       child.stderr = new PassThrough()
+      child.kill = () => { child.killed = true; queueMicrotask(() => child.emit("close", 0)); return true }
+      if (args.includes("--help")) {
+        queueMicrotask(() => { child.stdout.end(); child.stderr.end(); child.emit("close", 0) })
+        return child
+      }
+      const record = { file, args, options, methods: [], ended: false }
+      calls.push(record)
       child.stdin.on("finish", () => { record.ended = true })
       child.stdin.on("data", data => {
         for (const line of String(data).trim().split("\n")) {
@@ -363,7 +368,7 @@ test("account probes share in-flight work, cache failures, time out and clean wo
     Date.now = originalNow
     mode = "hang"
     assert.equal(await probeOfferedModels("fixture-agy", { key: "timeout-fixture", dir: null }), null)
-    assert.ok(delays.includes(5000))
+    assert.ok(delays.includes(15000))
     assert.equal(fs.existsSync(calls.at(-1).options.cwd), false)
     mode = "success"
     Object.defineProperty(process, "platform", { ...platform, value: "win32" })
