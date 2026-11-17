@@ -25,7 +25,7 @@ import { SummaryThoughtFilter } from "./thought-filter.mjs"
 import { sanitizeInputSchema, TOOL_SEARCH_INPUT_SCHEMA } from "./tool-schema.mjs"
 import { cloakUser, outgoing, hint, turnsAway } from "./cloak.mjs"
 import { fitTools } from "./tool-budget.mjs"
-import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, storedEmail, storedSignInNow } from "./signin.mjs"
+import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, readAccountSignIn, storedEmail, storedSignIn, storedSignInNow } from "./signin.mjs"
 import { AGY_MANUAL, installAgy, keepAgyCurrent } from "./install.mjs"
 import { COMPACTION_INSTRUCTIONS, compactionPrompts, openCodeCompactionStart } from "./compaction.mjs"
 import { fetchCloudCodeModels, getCachedCloudCodeModels, invalidateModelMetadataCache, isReasoningModel, resolveModelMetadata } from "./model-metadata.mjs"
@@ -144,10 +144,10 @@ const FILTER_SUMMARY_THOUGHTS = process.env.AGY_BRIDGE_KEEP_SUMMARY_THOUGHTS !==
 
 const ACP_CLIENT_INFO = Object.freeze({ name: PACKAGE_METADATA.name, version: PACKAGE_METADATA.version })
 const MODEL_CACHE_TTL_MS = 60_000
-// A cold `agy acp` handshake takes several seconds. Discovery waits this long
-// for the first confirmation, concurrently with `agy models` (15s cap).
+// A cold `agy acp` handshake or `agy models` call can take 27-39s on slow metadata calls.
+const LIST_MODELS_TIMEOUT_MS = 45_000
 const MODEL_PROBE_WAIT_MS = 10_000
-const MODEL_PROBE_STEP_MS = 5_000
+const MODEL_PROBE_STEP_MS = 15_000
 const MODEL_PROBE_RETRY_MS = 15_000
 
 const FALLBACK_MODELS = [
@@ -335,7 +335,7 @@ function accountEnv(env, geminiDir) {
 async function listAgyModels(agyPath, extraArgs = []) {
   const geminiDir = extraArgs.find(arg => arg.startsWith("--gemini_dir="))?.slice("--gemini_dir=".length)
   const { err, stdout, stderr, code } = await execOnce(agyPath, await modelsArgs(agyPath, extraArgs), {
-    timeoutMs: 15_000,
+    timeoutMs: configuredTimeout("AGY_BRIDGE_MODELS_TIMEOUT_MS", LIST_MODELS_TIMEOUT_MS),
     env: accountEnv(process.env, geminiDir),
   })
   if (wslDistro() && (err || code !== 0 || !stdout.trim())) throw new Error(`WSL agy models failed: ${err?.message || stderr?.trim() || "empty model response"}. Check wsl.exe, the configured distro and AGY_PATH; run agy in that same distro to sign in.`)
@@ -437,9 +437,10 @@ async function runOfferedProbe(agyPath, account) {
     child.on("error", error => conn?.close(error))
     child.on("close", () => conn?.close(new Error("agy model probe exited")))
     conn = new AcpConnection(child, { onNotification: () => {}, onRequest: async () => { throw Object.assign(new Error("not supported"), { code: -32601 }) }, onProtocolError: error => conn.close(error) })
-    const init = await conn.request("initialize", { protocolVersion: 1, clientInfo: ACP_CLIENT_INFO, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } }, MODEL_PROBE_STEP_MS)
+    const stepTimeoutMs = configuredTimeout("AGY_BRIDGE_MODEL_PROBE_STEP_MS", MODEL_PROBE_STEP_MS)
+    const init = await conn.request("initialize", { protocolVersion: 1, clientInfo: ACP_CLIENT_INFO, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } }, stepTimeoutMs)
     if (agyTooOld(init?.agentInfo?.version)) return null
-    const session = await conn.request("session/new", { cwd: wslPath(workspace, wslDistro()), mcpServers: [] }, MODEL_PROBE_STEP_MS)
+    const session = await conn.request("session/new", { cwd: wslPath(workspace, wslDistro()), mcpServers: [] }, stepTimeoutMs)
     const canClose = init?.agentCapabilities?.sessionCapabilities?.close ?? init?.agentCapabilities?.session_capabilities?.close
     if (session?.sessionId && canClose) await conn.request("session/close", { sessionId: session.sessionId }, 1000).catch(() => {})
     const models = offeredModelsFromSession(session)
@@ -1593,6 +1594,7 @@ class Proc {
     this.configMethodUnsupported = false
     this.configExpectation = null
     this.currentSelectionKey = null
+    this.offeredCount = 0
     this.instructionsInSession = false
     this.resumed = false
     this.child = null
@@ -1761,7 +1763,9 @@ class Proc {
     logBridgeEvent(this, null, this.resumed ? "resumed" : "created", this.replayReason)
     // Live handshakes are authoritative for this account scope and seed the
     // same cache used by provider discovery. A late probe cannot overwrite it.
-    seedOfferedModels(this.agyPath, { key: this.accountKey }, offeredModelsFromSession(session))
+    const offered = offeredModelsFromSession(session)
+    this.offeredCount = offered.length
+    seedOfferedModels(this.agyPath, { key: this.accountKey }, offered)
     // A resumed session reports the account default; always apply the selection.
     this.currentModel = session?.models?.currentModelId ?? null
     this.configOptions = Array.isArray(session?.configOptions) ? session.configOptions : []
@@ -1841,6 +1845,26 @@ class Proc {
       }
     } catch (error) {
       if (error.code === "config_confirmation_timeout" || error.code === "config_confirmation_conflict") throw error
+      const authMsg = /not (?:logged|signed) in(?:to)?\b|unauthenticated|authentication required|login required|please (?:log|sign) in|sign in again|\binvalid_grant\b/i
+      const signInReason = authMsg.test(`${error.message}\n${this.stderrTail}`)
+        ? "agy isn't signed in"
+        : !wslDistro()
+          ? cannotSignIn(this.geminiDir ? await readAccountSignIn(this.geminiDir) : await storedSignIn())
+          : ""
+      if (signInReason) {
+        const unauth = new Error(`agy bridge: ${signInReason}: sign in again in magpie, or run \`agy\` in a terminal`)
+        unauth.statusCode = 401
+        unauth.code = "unauthenticated"
+        unauth.noRetry = true
+        unauth.headers = { "X-Magpie-Sign-In": "expired" }
+        throw unauth
+      }
+      if (this.offeredCount === 0) {
+        const empty = new Error(`agy bridge: agy offered no models for this account when selecting ${model}: ${error.message}`)
+        empty.statusCode = 503
+        empty.code = "empty_model_catalog"
+        throw empty
+      }
       const wrapped = new Error(`agy bridge: model ${model} is unavailable to this agy account: ${error.message}`)
       wrapped.statusCode = 400
       throw wrapped
@@ -6443,10 +6467,11 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                 error: cachedAgyError || `agy CLI not found. Update magpie and try again to have it installed, or install Antigravity CLI yourself: ${AGY_MANUAL} — then run \`agy\` once to sign in.`,
               }
             }
-            const probe = await execOnce(agy, await modelsArgs(agy), { timeoutMs: 15_000 })
+            const modelsTimeoutMs = configuredTimeout("AGY_BRIDGE_MODELS_TIMEOUT_MS", LIST_MODELS_TIMEOUT_MS)
+            const probe = await execOnce(agy, await modelsArgs(agy), { timeoutMs: modelsTimeoutMs })
             if (probe.err || probe.code !== 0 || !probe.stdout.trim()) {
               const why = probe.timedOut
-                ? "timed out after 15s"
+                ? `timed out after ${Math.round(modelsTimeoutMs / 1000)}s`
                 : (probe.stderr || probe.stdout || "").trim() || probe.err?.message || "unknown error"
               return {
                 type: "failed",
@@ -6474,7 +6499,7 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
               const account = nativeAccount({ type: "api", key: result.key })
               const agy = findAgy()
               if (!agy) return { type: "failed", error: "agy CLI not found. Install the CLI before registering this account." }
-              const probe = await execOnce(agy, await modelsArgs(agy, [`--gemini_dir=${account.dir}`]), { timeoutMs: 15_000, env: accountEnv(process.env, account.dir), signal })
+              const probe = await execOnce(agy, await modelsArgs(agy, [`--gemini_dir=${account.dir}`]), { timeoutMs: configuredTimeout("AGY_BRIDGE_MODELS_TIMEOUT_MS", LIST_MODELS_TIMEOUT_MS), env: accountEnv(process.env, account.dir), signal })
               if (signal?.aborted) return { type: "failed", error: "Account registration was cancelled." }
               if (probe.err || probe.code !== 0 || !probe.stdout.trim()) return { type: "failed", error: "agy could not verify this saved account. Check its login before registering it." }
               forgetStoredSignIn({ dead: true })
@@ -6547,8 +6572,9 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
             } catch (error) {
               return jsonError(error.statusCode ?? 503, error instanceof NativeAccountError ? error.message : "Could not read the selected Bridge account.", error.code, true)
             }
-            if (!account.dir && !wslDistro()) {
-              const notSignedIn = cannotSignIn(storedSignInNow())
+            if (!wslDistro()) {
+              const signInState = account.dir ? await readAccountSignIn(account.dir) : storedSignInNow()
+              const notSignedIn = cannotSignIn(signInState)
               if (notSignedIn) {
                 return jsonError(
                   401,
@@ -6565,7 +6591,8 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
             try {
               model = resolveAgyModel(await loadModelCatalog(agy, false, account), requestedModel, body)
             } catch (error) {
-              return jsonError(error.statusCode ?? 502, error.message, error.code, error.noRetry)
+              return jsonError(error.statusCode ?? 502, error.message, error.code,
+                error.headers ? { noRetry: error.noRetry, headers: error.headers } : error.noRetry)
             }
             const selection = { model: requestedModel, effort: requestedEffort(body) }
             const sessionScope = requestSessionScope(fetchInput, init)
@@ -6895,7 +6922,8 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                     canRestore ? { clientCancelled: true, proc } : {})
                 }
               }
-              return jsonError(error.statusCode ?? 502, error.message, error.code, error.noRetry)
+              return jsonError(error.statusCode ?? 502, error.message, error.code,
+                error.headers ? { noRetry: error.noRetry, headers: error.headers } : error.noRetry)
             }
           },
         }

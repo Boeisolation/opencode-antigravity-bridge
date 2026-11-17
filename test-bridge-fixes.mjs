@@ -1647,3 +1647,155 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
     }
   }
 })
+
+
+test("sign-in guard checks named accounts, #setModel classifies 401/503/400, and agy models timeout is 45s+", async () => {
+  const caseRoot = path.join(root, "stabilize-13a")
+  const accountsDir = path.join(caseRoot, "accounts")
+  const convDir = path.join(caseRoot, "convs")
+  const stateFile = path.join(caseRoot, "state.json")
+  const badAccDir = path.join(accountsDir, "badacc")
+  const emptyAccDir = path.join(accountsDir, "emptyacc")
+  fs.mkdirSync(path.join(badAccDir, "antigravity-cli"), { recursive: true })
+  fs.writeFileSync(
+    path.join(badAccDir, "antigravity-cli", "antigravity-oauth-token"),
+    JSON.stringify({ token: { access_token: "stale-token", expiry: "2020-01-01T00:00:00Z" } }),
+  )
+  fs.mkdirSync(path.join(emptyAccDir, "antigravity-cli"), { recursive: true })
+  fs.writeFileSync(
+    path.join(emptyAccDir, "antigravity-cli", "antigravity-oauth-token"),
+    JSON.stringify({ token: { access_token: "ok-token", expiry: new Date(Date.now() + 3600_000).toISOString() } }),
+  )
+
+  const modeFile = path.join(caseRoot, "mode.txt")
+  const acpLog = path.join(caseRoot, "acp-spawns.txt")
+  fs.writeFileSync(modeFile, "empty-catalog")
+  fs.writeFileSync(acpLog, "")
+
+  const fakeDir = path.join(caseRoot, "bin")
+  const fakeBin = writeFakeAgy(fakeDir, `
+import fs from "node:fs";
+import readline from "node:readline";
+const args = process.argv.slice(2);
+if (args.includes("--help")) process.exit(0);
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+const mode = fs.readFileSync(${JSON.stringify(modeFile)}, "utf8").trim();
+if (args.includes("models")) {
+  if (mode === "slow-models") {
+    setTimeout(() => { console.log("gemini-test  Gemini Test"); process.exit(0); }, 220);
+  } else {
+    console.log("gemini-test  Gemini Test");
+    process.exit(0);
+  }
+} else {
+  fs.appendFileSync(${JSON.stringify(acpLog)}, mode + "\\n");
+  const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+  readline.createInterface({ input: process.stdin }).on("line", line => {
+    const msg = JSON.parse(line);
+    if (msg.method === "initialize") {
+      send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } }, agentInfo: { name: "fake-agy", version: "1.5.9" } } });
+    } else if (msg.method === "session/new") {
+      if (mode === "empty-catalog") {
+        send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-empty" } });
+      } else {
+        send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-nonempty", models: { availableModels: [{ modelId: "gemini-test", name: "Gemini Test" }] } } });
+      }
+    } else if (msg.method === "session/set_model" || msg.method === "session/set_config_option") {
+      if (mode === "empty-catalog") {
+        send({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "Model not found" } });
+      } else if (mode === "setmodel-unauth") {
+        send({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: "not logged in" } });
+      } else if (mode === "setmodel-bad") {
+        send({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "Unknown model ID" } });
+      } else {
+        send({ jsonrpc: "2.0", id: msg.id, result: {} });
+      }
+    }
+  });
+}
+`)
+
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+    AGY_BRIDGE_STORED_SIGNIN: process.env.AGY_BRIDGE_STORED_SIGNIN,
+    AGY_BRIDGE_DISABLE_KEYCHAIN: process.env.AGY_BRIDGE_DISABLE_KEYCHAIN,
+    AGY_BRIDGE_MODELS_TIMEOUT_MS: process.env.AGY_BRIDGE_MODELS_TIMEOUT_MS,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = convDir
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  process.env.AGY_BRIDGE_DISABLE_KEYCHAIN = "1"
+
+  try {
+    // 1. Named account without token fails fast with 401 + X-Magpie-Sign-In: expired before spawning agy.
+    delete process.env.AGY_BRIDGE_STORED_SIGNIN
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-13a=${Date.now()}`)
+    const pluginBad = await AntigravityBridgePlugin({ magpie: true }, { contextPort: 0 })
+    const loaderBad = await pluginBad.auth.loader(async () => ({ type: "api", key: "agy:badacc" }))
+    const resUnauth = await loaderBad.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, messages: [{ role: "user", content: "hi" }] }),
+    })
+    const bodyUnauth = await resUnauth.json()
+    assert.equal(resUnauth.status, 401, JSON.stringify(bodyUnauth))
+    assert.equal(bodyUnauth.error?.code, "unauthenticated")
+    assert.equal(resUnauth.headers.get("x-magpie-sign-in"), "expired")
+    assert.equal(fs.readFileSync(acpLog, "utf8"), "", "must reject before spawning ACP")
+
+    // 2. Empty offered models on session/new + session/set_model rejection -> 503 empty_model_catalog (not 400).
+    process.env.AGY_BRIDGE_STORED_SIGNIN = "skip"
+    fs.writeFileSync(modeFile, "empty-catalog")
+    const plugin = await AntigravityBridgePlugin({ magpie: true }, { contextPort: 0 })
+    const loader = await plugin.auth.loader(async () => ({ type: "api", key: "agy:emptyacc" }))
+    const resEmpty = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: "u-empty" }, messages: [{ role: "user", content: "hi" }] }),
+    })
+    const bodyEmpty = await resEmpty.json()
+    assert.equal(resEmpty.status, 503, JSON.stringify(bodyEmpty))
+    assert.equal(bodyEmpty.error?.code, "empty_model_catalog")
+
+    // 3. Non-empty offered models + auth error on session/set_model -> 401 unauthenticated + X-Magpie-Sign-In: expired.
+    fs.writeFileSync(modeFile, "setmodel-unauth")
+    const resSetUnauth = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: "u-setunauth" }, messages: [{ role: "user", content: "hi" }] }),
+    })
+    const bodySetUnauth = await resSetUnauth.json()
+    assert.equal(resSetUnauth.status, 401, JSON.stringify(bodySetUnauth))
+    assert.equal(bodySetUnauth.error?.code, "unauthenticated")
+    assert.equal(resSetUnauth.headers.get("x-magpie-sign-in"), "expired")
+    assert.equal(resSetUnauth.headers.get("x-should-retry"), "false")
+
+    // 4. Non-empty offered models + non-auth error on session/set_model -> 400 unavailable.
+    fs.writeFileSync(modeFile, "setmodel-bad")
+    const resBadModel = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: "u-badmodel" }, messages: [{ role: "user", content: "hi" }] }),
+    })
+    const bodyBadModel = await resBadModel.json()
+    assert.equal(resBadModel.status, 400, JSON.stringify(bodyBadModel))
+
+    // 5. AGY_BRIDGE_MODELS_TIMEOUT_MS configures models probe deadline; default (45s) succeeds when 220ms slow.
+    fs.writeFileSync(modeFile, "slow-models")
+    const savedMethod = plugin.auth.methods.findLast(m => m.prompts?.some(p => p.key === "name"))
+    assert.ok(savedMethod)
+    process.env.AGY_BRIDGE_MODELS_TIMEOUT_MS = "50"
+    const timedOutAuth = await savedMethod.authorize({ name: "emptyacc" })
+    assert.equal(timedOutAuth.type, "failed")
+    delete process.env.AGY_BRIDGE_MODELS_TIMEOUT_MS
+    const okAuth = await savedMethod.authorize({ name: "emptyacc" })
+    assert.equal(okAuth.type, "success", JSON.stringify(okAuth))
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
