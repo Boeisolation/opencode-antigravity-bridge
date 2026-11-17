@@ -1383,3 +1383,267 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     }
   }
 })
+
+
+test("tool state machine handles foldSplitCalls, movedOnVerdict, droppedPendingCalls, carriedAnswered, and thinking prefill", async () => {
+  const convDir = path.join(root, "conv-tsm")
+  const accountsDir = path.join(root, "accounts-tsm")
+  const stateFile = path.join(root, "state-tsm.json")
+  const fakeDir = path.join(root, "fake-tsm-agy")
+  fs.mkdirSync(convDir, { recursive: true })
+  fs.mkdirSync(accountsDir, { recursive: true })
+  const fakeBin = writeFakeAgy(fakeDir, `
+import net from "node:net";
+import readline from "node:readline";
+const args = process.argv.slice(2);
+if (args.includes("--help")) process.exit(0);
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
+let count = 0;
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+function mcpCall(name, input) {
+  return new Promise((resolve, reject) => {
+    const port = Number(process.env.AGY_BRIDGE_CONTROL_PORT);
+    const token = process.env.AGY_BRIDGE_TOKEN;
+    const sock = net.createConnection({ host: "127.0.0.1", port }, () => {
+      sock.write(JSON.stringify({ token, kind: "call", name, input }) + "\\n");
+    });
+    let buf = "";
+    sock.on("data", chunk => {
+      buf += chunk.toString("utf8");
+      const nl = buf.indexOf("\\n");
+      if (nl < 0) return;
+      resolve(JSON.parse(buf.slice(0, nl)));
+      sock.destroy();
+    });
+    sock.on("error", reject);
+  });
+}
+function watchTools() {
+  return new Promise((resolve, reject) => {
+    const port = Number(process.env.AGY_BRIDGE_CONTROL_PORT);
+    const token = process.env.AGY_BRIDGE_TOKEN;
+    const watch = net.createConnection({ host: "127.0.0.1", port }, () => {
+      watch.write(JSON.stringify({ token, kind: "watch" }) + "\\n");
+    });
+    watch.unref();
+    const sock = net.createConnection({ host: "127.0.0.1", port }, () => {
+      sock.write(JSON.stringify({ token, kind: "list" }) + "\\n");
+    });
+    let buf = "";
+    sock.on("data", chunk => {
+      buf += chunk.toString("utf8");
+      const nl = buf.indexOf("\\n");
+      if (nl < 0) return;
+      resolve(JSON.parse(buf.slice(0, nl)));
+      sock.destroy();
+    });
+    sock.on("error", reject);
+  });
+}
+let activeSid = null;
+let cancelPrompt = null;
+readline.createInterface({ input: process.stdin }).on("line", async line => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } }, agentInfo: { name: "fake-agy", version: "1.5.9" } } });
+  } else if (msg.method === "session/new") {
+    await watchTools();
+    activeSid = "s-tsm-" + (++count) + "-" + process.pid;
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: activeSid } });
+  } else if (msg.method === "session/set_model" || msg.method === "session/set_config_option") {
+    send({ jsonrpc: "2.0", id: msg.id, result: {} });
+  } else if (msg.method === "session/cancel") {
+    cancelPrompt?.();
+  } else if (msg.method === "session/prompt") {
+    const sid = msg.params?.sessionId;
+    const text = (msg.params?.prompt || []).map(p => p.text || "").join("\\n");
+    if (text.includes("START_SPLIT") && !text.includes("<conversation_history>")) {
+      const r = await mcpCall("batch_read", { paths: ["a.txt", "b.txt"] });
+      const resText = (r.result?.content || []).map(p => p.text || "").join("|");
+      send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "split:" + sid + ":" + resText } } } });
+      send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+    } else if (text.includes("START_DROP") && !text.includes("<conversation_history>")) {
+      send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "partial:" + sid } } } });
+      const mcpPromise = mcpCall("batch_read", { paths: ["x.txt"] });
+      const cancelled = await new Promise(resolve => {
+        cancelPrompt = () => resolve(true);
+        mcpPromise.then(() => {});
+      });
+      cancelPrompt = null;
+      await mcpPromise;
+      send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: cancelled ? "cancelled" : "end_turn" } });
+    } else if (text.includes("START_DUAL") && !text.includes("<conversation_history>")) {
+      const open = (paths) => new Promise((resolve, reject) => {
+        const port = Number(process.env.AGY_BRIDGE_CONTROL_PORT);
+        const sock = net.createConnection({ host: "127.0.0.1", port }, () => resolve({ sock, paths }));
+        sock.on("error", reject);
+      });
+      const conns = await Promise.all([open(["1"]), open(["2"])]);
+      const token = process.env.AGY_BRIDGE_TOKEN;
+      await Promise.all(conns.map(({ sock, paths }) => new Promise((resolve, reject) => {
+        let buf = "";
+        sock.on("data", chunk => { buf += chunk; const nl = buf.indexOf("\\n"); if (nl >= 0) { resolve(JSON.parse(buf.slice(0, nl))); sock.destroy(); } });
+        sock.on("error", reject);
+        sock.write(JSON.stringify({ token, kind: "call", name: "batch_read", input: { paths } }) + "\\n");
+      })));
+      send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+    } else {
+      send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok:" + sid } } } });
+      send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+    }
+  }
+});
+`)
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = convDir
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  const tools = [{ name: "batch_read", input_schema: { type: "object", properties: { paths: { type: "array", items: { type: "string" } } } } }]
+  try {
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-tsm=${Date.now()}`)
+    const plugin = await AntigravityBridgePlugin()
+    const loader = await plugin.auth.loader()
+
+    // 1. foldSplitCalls: split Hermes tool_use + tool_results fold back into the live MCP call.
+    const rSplit1 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, tools, metadata: { user_id: "u-split" }, messages: [{ role: "user", content: "START_SPLIT" }] }),
+    })
+    const bSplit1 = await rSplit1.json()
+    const splitUse = bSplit1.content.find(b => b.type === "tool_use")
+    assert.ok(splitUse)
+    const rSplit2 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        tools,
+        metadata: { user_id: "u-split" },
+        messages: [
+          { role: "user", content: "START_SPLIT" },
+          { role: "assistant", content: [
+            { type: "tool_use", id: splitUse.id, name: "batch_read", input: { paths: ["a.txt"] } },
+            { type: "tool_use", id: "call_hermes_2", name: "batch_read", input: { paths: ["b.txt"] } },
+          ] },
+          { role: "user", content: [
+            { type: "tool_result", tool_use_id: splitUse.id, content: "A" },
+            { type: "tool_result", tool_use_id: "call_hermes_2", content: "B" },
+          ] },
+        ],
+      }),
+    })
+    const bSplit2 = await rSplit2.json()
+    assert.equal(rSplit2.status, 200, JSON.stringify(bSplit2))
+    assert.match(bSplit2.content?.[0]?.text || "", /^split:s-tsm-.*:A\|B$/)
+
+    // 2. droppedPendingCalls + keepDroppedTurn keeps the same live session when pending tool_use is dropped.
+    const rDrop1 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, tools, metadata: { user_id: "u-drop" }, messages: [{ role: "user", content: "START_DROP" }] }),
+    })
+    const bDrop1 = await rDrop1.json()
+    assert.equal(bDrop1.stop_reason, "tool_use")
+    const dropPartial = bDrop1.content.find(b => b.type === "text")?.text || ""
+    const dropSid = dropPartial.replace(/^partial:/, "")
+    const rDrop2 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        tools,
+        metadata: { user_id: "u-drop" },
+        messages: [
+          { role: "user", content: "START_DROP" },
+          { role: "assistant", content: [{ type: "text", text: dropPartial }] },
+          { role: "user", content: "continue without tool" },
+        ],
+      }),
+    })
+    const bDrop2 = await rDrop2.json()
+    assert.equal(rDrop2.status, 200, JSON.stringify(bDrop2))
+    assert.equal(bDrop2.content?.[0]?.text, "ok:" + dropSid)
+
+    // 3. movedOnVerdict replays immediately on first unmatched result after another provider's tool call.
+    const rMove1 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, tools, metadata: { user_id: "u-move" }, messages: [{ role: "user", content: "START_DROP" }] }),
+    })
+    const bMove1 = await rMove1.json()
+    const moveUse = bMove1.content.find(b => b.type === "tool_use")
+    const rMove2 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        tools,
+        metadata: { user_id: "u-move" },
+        messages: [
+          { role: "user", content: "START_DROP" },
+          { role: "assistant", content: bMove1.content },
+          { role: "user", content: "try another" },
+          { role: "assistant", content: [{ type: "tool_use", id: "call_other_provider_1", name: "batch_read", input: { paths: ["y.txt"] } }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "call_other_provider_1", content: "Y" }] },
+        ],
+      }),
+    })
+    const bMove2 = await rMove2.json()
+    assert.equal(rMove2.status, 200, JSON.stringify(bMove2))
+    assert.match(bMove2.content?.[0]?.text || "", /^ok:s-tsm-/)
+
+    // 4. carriedAnswered supersedes cleanly when a carried subset is answered in history, and assistantTextOf skips thinking blocks.
+    const rCar1 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, tools, metadata: { user_id: "u-car" }, messages: [{ role: "user", content: "START_DUAL" }] }),
+    })
+    const bCar1 = await rCar1.json()
+    const dualUses = bCar1.content.filter(b => b.type === "tool_use")
+    assert.ok(dualUses.length >= 1)
+    const rCar2 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        tools,
+        metadata: { user_id: "u-car" },
+        messages: [
+          { role: "user", content: "START_DUAL" },
+          { role: "assistant", content: [dualUses[0]] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: dualUses[0].id, content: "only first" }] },
+          { role: "user", content: "move on without second call" },
+        ],
+      }),
+    })
+    const bCar2 = await rCar2.json()
+    assert.equal(rCar2.status, 200, JSON.stringify(bCar2))
+
+    // 5. assistantTextOf skips thinking/redacted_thinking blocks in prefill tail.
+    const rPrefill = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        metadata: { user_id: "u-prefill-think" },
+        messages: [
+          { role: "user", content: "start" },
+          { role: "assistant", content: [{ type: "thinking", thinking: "internal" }, { type: "redacted_thinking", data: "x" }, { type: "text", text: "Answer: " }] },
+        ],
+      }),
+    })
+    const bPrefill = await rPrefill.json()
+    assert.equal(rPrefill.status, 200, JSON.stringify(bPrefill))
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})

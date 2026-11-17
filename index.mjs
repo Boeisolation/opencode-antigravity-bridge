@@ -97,6 +97,7 @@ const CANCEL_SETTLE_MS = 15_000
 const STEER_WAIT_RETRY_MS = [50, 150, 400]
 const RECLAIM_STOP_TIMEOUT_MS = 10_000
 const SUPERSEDED_NOTE = "agy bridge: this tool call was superseded because the client conversation continued without it; stop this turn"
+const DROPPED_NOTE = "agy bridge: cancelled by the client, not executed; the conversation continues with the next message"
 const SELF_POLL_IDLE_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_SELF_POLL_IDLE_TIMEOUT_MS, 20 * 60 * 1000)
 const SELF_POLL_LIMIT = positiveTimeout(process.env.AGY_BRIDGE_SELF_POLL_LIMIT, 8)
 const SELF_POLL_NOTE = "agy bridge: gave up waiting for this tool: the client never returned a result for it; stop this turn"
@@ -3465,16 +3466,22 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     await Promise.race([existing.turn.settled, new Promise((resolve) => setTimeout(resolve, CANCEL_SETTLE_MS))])
   }
   if (existing && !existing.dead && existing.turn) {
-    const lineage = lineageVerdict(existing, existing.turn, opts)
-    if (lineage === "fork") {
+    let lineage = lineageVerdict(existing, existing.turn, opts)
+    if (lineage === "dropped") {
+      const held = existing.turn
+      const kept = await keepDroppedTurn(existing, held, opts)
+      logBridgeEvent(existing, held, kept ? "kept" : "keep_failed", "lineage_dropped", opts)
+      if (!kept) lineage = "fork"
+    }
+    if (lineage === "fork" || lineage === "answered") {
       opts.validateReplay?.()
-      opts.replayReason = "lineage_fork"
+      opts.replayReason = lineage === "answered" ? "lineage_answered" : "lineage_fork"
       const orphan = existing.turn
-      if (!staleTurnVerdict(existing, orphan).stale && !pendingCallsAnsweredIn(orphan, opts.history)) {
+      if (lineage === "fork" && !staleTurnVerdict(existing, orphan).stale && !pendingCallsAnsweredIn(orphan, opts.history)) {
         logBridgeEvent(existing, orphan, "isolated", "lineage_fork", opts)
         convKey = `${convKey.split(":fork:")[0]}:fork:${randomUUID()}`
       } else {
-        logBridgeEvent(existing, orphan, "superseded", "lineage_fork", opts, { superseded_turn_id: orphan.turnId })
+        logBridgeEvent(existing, orphan, "superseded", opts.replayReason, opts, { superseded_turn_id: orphan.turnId })
         await reclaimStaleTurn(existing, orphan, SUPERSEDED_NOTE)
       }
       existing = null
@@ -3559,6 +3566,23 @@ function logBridgeEvent(proc, turn, action, reason, meta = {}, extra = {}) {
   try { process.stderr.write("[agy-bridge] " + JSON.stringify(row) + "\n") } catch {}
 }
 
+const BRIDGE_CALL_ID = /^toolu_[0-9a-f]{24}$/i
+
+function movedOnVerdict(turn, messages) {
+  if (!turn || turn.attached || turn.steering || turn.cancelRequested || !Array.isArray(messages)) return null
+  if (!turn.hasPendingMcp()) return null
+  const own = new Set(turn.calls.map((call) => call.id))
+  let last = -1
+  messages.forEach((message, index) => {
+    if (Array.isArray(message?.content) && message.content.some((block) =>
+      (block?.type === "tool_use" && own.has(block.id)) || (block?.type === "tool_result" && own.has(block.tool_use_id)))) last = index
+  })
+  if (last < 0) return null
+  const foreign = messages.slice(last + 1).some((message) => message?.role === "assistant" && Array.isArray(message.content) &&
+    message.content.some((block) => block?.type === "tool_use" && typeof block.id === "string" && block.id && !BRIDGE_CALL_ID.test(block.id)))
+  return foreign ? { stale: true, reason: "moved_on" } : null
+}
+
 function staleTurnVerdict(proc, turn, now = Date.now()) {
   if (!turn || turn.cancelRequested) return { stale: false, reason: "cancelling" }
   if (turn.attached) return { stale: false, reason: "attached" }
@@ -3577,6 +3601,10 @@ function lineageVerdict(proc, turn, opts) {
   // history, so the live turn can never receive them: it was abandoned (e.g. its
   // tool-result request failed, or client-side compaction rewrote the base).
   if (pendingCallsAnsweredIn(turn, history)) return "fork"
+  const allIds = new Set(turn.calls.map((call) => call.id).filter(Boolean))
+  const carriedAll = (opts.messages || []).some((message) => Array.isArray(message?.content) &&
+    message.content.some((block) => block?.type === "tool_use" && allIds.has(block.id)))
+  if (carriedAll && carriedAnswered(opts.messages, allIds)) return "answered"
   const base = turn.baseHistory
   if (!Array.isArray(history)) return null
   // The request no longer follows the conversation the waiting turn was told
@@ -3604,7 +3632,67 @@ function lineageVerdict(proc, turn, opts) {
   if (!carried && !recorded && Array.isArray(expected) && expected.length > base.length &&
     history.length === expected.length &&
     historyKey(withoutInputs(history)) === historyKey(withoutInputs(expected))) return null
+  if (!carried && !recorded && !opts.hasToolResults && droppedPendingCalls(turn, expected, base, history)) return "dropped"
   return carried || recorded ? "conflict" : "fork"
+}
+
+function droppedPendingCalls(turn, expected, base, history) {
+  if (!Array.isArray(expected) || expected.length <= base.length || history.length !== expected.length) return false
+  const pending = new Set(turn.calls.filter((call) => call.id && !call.result && !call.mcpResponded).map((call) => call.id))
+  if (!pending.size) return false
+  let removed = 0
+  const stripped = expected.map((message) => {
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) return message
+    const content = message.content.filter((block) => !(block?.type === "tool_use" && pending.has(block.id)))
+    removed += message.content.length - content.length
+    return { ...message, content }
+  })
+  if (removed !== pending.size) return false
+  const last = stripped.at(-1)
+  if (last?.role !== "assistant" || !last.content.some((block) => block?.type === "text" && block.text?.trim())) return false
+  if (stripped.slice(base.length).some((message) => Array.isArray(message.content) && !message.content.length)) return false
+  return historyKey(stripped) === historyKey(history)
+}
+
+function carriedAnswered(messages, ids) {
+  const open = new Set()
+  for (const message of messages || []) {
+    if (!Array.isArray(message?.content)) continue
+    for (const block of message.content) {
+      if (block?.type === "tool_use" && ids.has(block.id)) open.add(block.id)
+      else if (block?.type === "tool_result") open.delete(block.tool_use_id)
+    }
+  }
+  return open.size === 0
+}
+
+async function keepDroppedTurn(proc, turn, opts) {
+  if (proc.dead || proc.stopping || proc.retiring || proc.steering || proc.turn !== turn ||
+    turn.steering || turn.done || turn.finalized || !Array.isArray(opts.history)) return false
+  const known = new Set(proc.tools.map((tool) => tool.name))
+  const toolsGrew = (opts.tools || []).some((tool) => !known.has(tool.name))
+  if (toolsGrew || proc.workDir !== opts.workDir || !sameInstructions(proc.instructions, opts.instructions)) return false
+  const results = turn.calls.filter((call) => call.id && !call.result && !call.mcpResponded).map((call) => ({
+    block: { tool_use_id: call.id, content: DROPPED_NOTE, is_error: true },
+    call,
+    result: { content: [{ type: "text", text: DROPPED_NOTE }], isError: true },
+  }))
+  if (!results.length) return false
+  proc.steering = true
+  try {
+    proc.continueWith(results)
+    if (turn.hasPendingMcp()) return false
+    if (!turn.done && !turn.finalized && !proc.cancelTurn(turn, [])) return false
+    await Promise.race([turn.settled, new Promise((resolve) => setTimeout(resolve, CANCEL_SETTLE_MS))])
+    if (turn.done && !turn.finalized) proc.finalizeTurn(turn)
+    if (!turn.finalized || proc.dead || proc.stopping || proc.historyInvalid || proc.turn) return false
+    proc.expectedMessages = opts.history.map((message) => ({ ...message }))
+    return true
+  } catch {
+    return false
+  } finally {
+    proc.steering = false
+  }
 }
 
 function pendingCallsAnsweredIn(turn, history) {
@@ -3669,7 +3757,7 @@ async function recoverStaleTurn(ctx) {
     if (current !== ctx.proc || current?.turn !== ctx.turn) {
       throw new ConflictError("agy bridge: this turn was already replaced. Stop resending this request.", "tool_state_conflict")
     }
-    const verdict = staleTurnVerdict(current, ctx.turn)
+    const verdict = movedOnVerdict(ctx.turn, ctx.body.messages) ?? staleTurnVerdict(current, ctx.turn)
     // As in the local fix, lineage supersession belongs to acquisition of a
     // new prompt. Unmatched results alone must not reclaim an unexpired owner.
     if (!verdict.stale) return null
@@ -4216,7 +4304,9 @@ function assistantTextOf(message) {
   if (!Array.isArray(message.content)) return null
   let text = ""
   for (const block of message.content) {
-    if (!block || block.type !== "text" || typeof block.text !== "string") return null
+    if (!block) return null
+    if (block.type === "thinking" || block.type === "redacted_thinking") continue
+    if (block.type !== "text" || typeof block.text !== "string") return null
     text += block.text
   }
   return text
@@ -4262,6 +4352,65 @@ function lastAssistantCalls(messages) {
   while (start > 0 && messages[start - 1].role === "assistant") start--
   return messages.slice(start).flatMap(message => Array.isArray(message.content)
     ? message.content.filter(block => block.type === "tool_use") : [])
+}
+
+function foldSplitCalls(body) {
+  const messages = body?.messages
+  if (!Array.isArray(messages)) return body
+  let changed = false
+  const out = messages.map((message) => message)
+  for (let index = 0; index < out.length; index++) {
+    const message = out[index]
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) continue
+    const uses = message.content.filter((block) => block?.type === "tool_use")
+    if (uses.length < 2) continue
+    const head = uses[0]
+    if (!BRIDGE_CALL_ID.test(head.id ?? "") || uses.slice(1).some((use) => BRIDGE_CALL_ID.test(use.id ?? "") || !use.id)) continue
+    if (uses.some((use) => use.name !== head.name)) continue
+    const keyOf = (use) => {
+      const input = use.input
+      if (!input || typeof input !== "object" || Array.isArray(input)) return null
+      const keys = Object.keys(input)
+      return keys.length === 1 && Array.isArray(input[keys[0]]) ? keys[0] : null
+    }
+    const key = keyOf(head)
+    if (!key || uses.some((use) => keyOf(use) !== key)) continue
+    const ids = new Set(uses.map((use) => use.id))
+    if (ids.size !== uses.length) continue
+    const results = []
+    let end = index + 1
+    while (end < out.length && out[end]?.role !== "assistant") end++
+    for (let at = index + 1; at < end; at++) {
+      const content = out[at]?.content
+      if (!Array.isArray(content)) continue
+      for (const block of content) if (block?.type === "tool_result" && ids.has(block.tool_use_id)) results.push(block)
+    }
+    if (results.length && results.length !== uses.length) continue
+    const folded = { ...head, input: { [key]: uses.flatMap((use) => use.input[key]) } }
+    out[index] = { ...message, content: message.content.filter((block) => block?.type !== "tool_use" || block === head).map((block) => (block === head ? folded : block)) }
+    if (results.length) {
+      const byId = new Map(results.map((block) => [block.tool_use_id, block]))
+      const parts = (block) => typeof block.content === "string" ? [{ type: "text", text: block.content }]
+        : Array.isArray(block.content) ? block.content : block.content == null ? [] : [block.content]
+      const ordered = uses.map((use) => byId.get(use.id))
+      const merged = { ...byId.get(head.id), content: ordered.flatMap(parts) }
+      if (ordered.every((block) => block.is_error)) merged.is_error = true
+      else delete merged.is_error
+      for (let at = index + 1; at < end; at++) {
+        const content = out[at]?.content
+        if (!Array.isArray(content) || !content.some((block) => block?.type === "tool_result" && ids.has(block.tool_use_id))) continue
+        out[at] = { ...out[at], content: content.flatMap((block) => {
+          if (block?.type !== "tool_result" || !ids.has(block.tool_use_id)) return [block]
+          return block.tool_use_id === head.id ? [merged] : []
+        }) }
+      }
+      for (let at = end - 1; at > index; at--) {
+        if (Array.isArray(out[at]?.content) && out[at].content.length === 0) { out.splice(at, 1); end-- }
+      }
+    }
+    changed = true
+  }
+  return changed ? { ...body, messages: out } : body
 }
 
 function sameSessionScope(proc, sessionScope = "") {
@@ -6411,7 +6560,7 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
             }
             const requestedModel = modelId.replace(/\[1m\]$/i, "")
             const layout = canonicalBody(body) === body ? "hoisted" : "inline"
-            body = { ...canonicalBody(body), model: requestedModel }
+            body = { ...foldSplitCalls(canonicalBody(body)), model: requestedModel }
             let model
             try {
               model = resolveAgyModel(await loadModelCatalog(agy, false, account), requestedModel, body)
@@ -6624,7 +6773,13 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                       : toolsGrew ? "tools_grew" : proc.workDir !== workDir ? "work_dir_changed"
                       : !sameInstructions(proc.instructions, instructions) ? "instructions_changed"
                       : turn.done ? "tool_turn_ended" : turn.cancelRequested ? "tool_turn_cancelling" : "incomplete_tool_results"
-                    logBridgeEvent(proc, turn, "replay", acquireOpts.replayReason)
+                    logBridgeEvent(proc, turn, "replay", acquireOpts.replayReason, acquireOpts, {
+                      history: trailingMessages(body).history.length,
+                      expected_history: Array.isArray(proc.expectedMessages) ? proc.expectedMessages.length : null,
+                      tools_grew: !!toolsGrew,
+                      work_dir_changed: proc.workDir !== workDir,
+                      instructions_changed: !sameInstructions(proc.instructions, instructions),
+                    })
                     claim()
                     // Incompatible context needs replay. Keep the results for
                     // the new session and close the old process's calls.
