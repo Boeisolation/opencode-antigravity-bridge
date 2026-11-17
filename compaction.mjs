@@ -12,6 +12,18 @@ const STOCK_PROMPTS = new Set([
   "6c4096c2b2cf8dbce360bf0248054337ef1f1dc21b4633d247c56e1bcaa24e81",
 ])
 const NUDGE = "The previous response did not fill in the required summary template. Do not call tools. Return the summary as text using the exact section headings from the template."
+const CLAUDE_COMPACTION_MARKER = "Your task is to create a detailed summary of the conversation so far"
+const CLAUDE_CRITICAL_PREAMBLE = "CRITICAL: Respond with TEXT ONLY."
+
+function isClaudeCompactionText(text) {
+  const normalized = text.replace(/\r\n/g, "\n").trim()
+  const idx = normalized.indexOf(CLAUDE_COMPACTION_MARKER)
+  if (idx < 0) return false
+  const before = normalized.slice(0, idx)
+  if (idx > 0 && !before.startsWith(CLAUDE_CRITICAL_PREAMBLE) && !before.endsWith("\n\n")) return false
+  const line = normalized.slice(idx).split("\n", 1)[0]
+  return /^(?:[,.]|$)/.test(line.slice(CLAUDE_COMPACTION_MARKER.length))
+}
 
 function textOnly(message) {
   if (message?.role !== "user") return null
@@ -33,7 +45,8 @@ export function openCodeCompactionStart(messages) {
   const tail = last >= 0 && message.content[last]?.type === "text" ? message.content[last].text : null
   const text = typeof tail === "string" ? tail.trim() : textOnly(message)
   if ((index < 1 && last < 1) || !text) return -1
-  return STOCK_PROMPTS.has(createHash("sha256").update(text.replace(/\r\n/g, "\n")).digest("hex")) ? index : -1
+  if (STOCK_PROMPTS.has(createHash("sha256").update(text.replace(/\r\n/g, "\n")).digest("hex"))) return index
+  return isClaudeCompactionText(text) ? index : -1
 }
 
 export const COMPACTION_INSTRUCTIONS = "You are summarizing an existing conversation for continuation. " +
