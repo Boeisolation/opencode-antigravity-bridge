@@ -103,7 +103,7 @@ test("createUsageReader avoids spawning agy when expired/dead and latches dead c
   await fs.mkdir(path.join(workDir, "antigravity-cli"), { recursive: true })
   await fs.writeFile(
     path.join(workDir, "antigravity-cli", "antigravity-oauth-token"),
-    JSON.stringify({ token: { access_token: "a", refresh_token: "r", expiry: new Date(Date.now() + 60_000).toISOString() } }),
+    JSON.stringify({ token: { access_token: "a", refresh_token: "r", expiry: new Date(Date.now() + 10 * 60_000).toISOString() } }),
   )
   const stored = await readAccountSignIn(workDir, { env })
   assert.equal(stored.state, "present")
