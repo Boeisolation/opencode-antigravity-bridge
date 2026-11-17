@@ -1943,3 +1943,129 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     }
   }
 })
+
+
+test("WP2 glue wires agyRefusal into models()/#setModel/#formatAgentError and populates storeCatalogRows", async () => {
+  const caseRoot = path.join(root, "wp2-glue")
+  const accountsDir = path.join(caseRoot, "accounts")
+  const convDir = path.join(caseRoot, "convs")
+  const stateFile = path.join(caseRoot, "state.json")
+  const modeFile = path.join(caseRoot, "mode.txt")
+  const accOkDir = path.join(accountsDir, "okacc")
+  const accBlockedDir = path.join(accountsDir, "blockedacc")
+  const accVerifyDir = path.join(accountsDir, "verifyacc")
+  fs.mkdirSync(convDir, { recursive: true })
+  fs.mkdirSync(path.join(accOkDir, "antigravity-cli"), { recursive: true })
+  fs.writeFileSync(
+    path.join(accOkDir, "antigravity-cli", "antigravity-oauth-token"),
+    JSON.stringify({ token: { access_token: "ok-token", expiry: new Date(Date.now() + 3600_000).toISOString() } }),
+  )
+  fs.mkdirSync(path.join(accBlockedDir, "antigravity-cli"), { recursive: true })
+  fs.writeFileSync(
+    path.join(accBlockedDir, "antigravity-cli", "antigravity-oauth-token"),
+    JSON.stringify({ token: { access_token: "stale", expiry: "2020-01-01T00:00:00Z" } }),
+  )
+  fs.mkdirSync(path.join(accVerifyDir, "antigravity-cli"), { recursive: true })
+  fs.writeFileSync(
+    path.join(accVerifyDir, "antigravity-cli", "antigravity-oauth-token"),
+    JSON.stringify({ token: { access_token: "verify-token", expiry: new Date(Date.now() + 3600_000).toISOString() } }),
+  )
+  fs.writeFileSync(modeFile, "live-catalog")
+
+  const fakeDir = path.join(caseRoot, "bin")
+  const fakeBin = writeFakeAgy(fakeDir, `
+import fs from "node:fs";
+import readline from "node:readline";
+const args = process.argv.slice(2);
+if (args.includes("--help")) process.exit(0);
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+const mode = fs.readFileSync(${JSON.stringify(modeFile)}, "utf8").trim();
+if (args.includes("models")) {
+  if (mode === "verify-refusal") {
+    console.error("Verification Required. Please complete verification in your browser to continue: https://accounts.google.com/v?t=123");
+    process.exit(1);
+  }
+  if (mode === "license-refusal") {
+    console.error("You do not have a valid license of this product (#3501)");
+    process.exit(1);
+  }
+  console.log("gemini-live-9  Live Gemini Nine");
+  process.exit(0);
+}
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+readline.createInterface({ input: process.stdin }).on("line", line => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } }, agentInfo: { name: "fake-agy", version: "1.5.9" } } });
+  } else if (msg.method === "session/new") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-glue-1" } });
+  } else if (msg.method === "session/set_model" || msg.method === "session/set_config_option") {
+    send({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "Unknown model ID" } });
+  }
+});
+`)
+
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+    AGY_BRIDGE_STORED_SIGNIN: process.env.AGY_BRIDGE_STORED_SIGNIN,
+    AGY_BRIDGE_DISABLE_KEYCHAIN: process.env.AGY_BRIDGE_DISABLE_KEYCHAIN,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = convDir
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  process.env.AGY_BRIDGE_DISABLE_KEYCHAIN = "1"
+  process.env.AGY_BRIDGE_STORED_SIGNIN = "skip"
+
+  try {
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-wp2-glue=${Date.now()}`)
+    const { catalogRows } = await import("./model-ids.mjs")
+    const plugin = await AntigravityBridgePlugin({ magpie: true }, { contextPort: 0 })
+
+    // 1. Live models() populates model-ids catalogRows(), and a subsequent fallback account keeps live rows intact.
+    const liveModels = await plugin.provider.models({}, { auth: { type: "api", key: "agy:okacc" } })
+    assert.ok(liveModels["gemini-live-9"])
+    const rowsAfterLive = catalogRows()
+    assert.ok(Array.isArray(rowsAfterLive) && rowsAfterLive.some(r => r.id === "gemini-live-9" && r.name === "Live Gemini Nine"))
+
+    delete process.env.AGY_BRIDGE_STORED_SIGNIN
+    const blockedModels = await plugin.provider.models({}, { auth: { type: "api", key: "agy:blockedacc" } })
+    assert.equal(blockedModels[Symbol.for("magpie.fellBack")], true)
+    assert.ok(catalogRows()?.some(r => r.id === "gemini-live-9"), "fallback catalog must not erase live catalogRows()")
+    process.env.AGY_BRIDGE_STORED_SIGNIN = "skip"
+
+    // 2. License refusal from agy models causes models() to throw refusal reason instead of returning FALLBACK_MODELS.
+    fs.writeFileSync(modeFile, "license-refusal")
+    await assert.rejects(
+      () => plugin.provider.models({}, { auth: { type: "api", key: "agy:okacc" } }),
+      err => /valid license of this product|\(#3501\)/i.test(err.message),
+    )
+
+    // 3. Recovery: when agy models succeeds again, refusal clears and models() returns live catalog.
+    fs.writeFileSync(modeFile, "live-catalog")
+    const recoveredModels = await plugin.provider.models({}, { auth: { type: "api", key: "agy:okacc" } })
+    assert.ok(recoveredModels["gemini-live-9"])
+
+    // 4. Verification refusal in #setModel path (fresh account never listed via models()): returns 403 AGY_ERROR_FORBIDDEN with verification link, not 503 empty_model_catalog.
+    fs.writeFileSync(modeFile, "verify-refusal")
+    const loader = await plugin.auth.loader(async () => ({ type: "api", key: "agy:verifyacc" }))
+    const resVerify = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-4-argon-high", stream: false, metadata: { user_id: "u-verify-refusal" }, messages: [{ role: "user", content: "hi" }] }),
+    })
+    const bodyVerify = await resVerify.json()
+    assert.equal(resVerify.status, 403, JSON.stringify(bodyVerify))
+    assert.equal(bodyVerify.error?.code, "AGY_ERROR_FORBIDDEN")
+    assert.match(bodyVerify.error?.message || "", /https:\/\/accounts\.google\.com\/v\?t=123/)
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
