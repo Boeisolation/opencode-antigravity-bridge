@@ -214,3 +214,17 @@ test("proc.mjs treats Linux zombie and dead processes as non-existent even when 
   assert.equal(processExists(42, { platform: "linux", kill: () => { throw Object.assign(new Error("nope"), { code: "ESRCH" }) } }), false)
   assert.equal(processExists(42, { platform: "linux", kill: () => { throw Object.assign(new Error("perm"), { code: "EPERM" }) }, readFile: () => "42 (agy) S 1 42 42" }), true)
 })
+
+
+test("windowsNcBuild builds GUI-subsystem nc.exe only under bun/magpie-bun runtimes", async () => {
+  const { windowsNcBuild } = await import("./platform.mjs")
+  assert.deepEqual(
+    windowsNcBuild("C:\\Users\\Alice\\AppData\\Local\\magpie-bun.exe", "C:\\plugin\\mcp-server.mjs", "C:\\tmp\\nc.exe", { bun: "1.2.0" }),
+    {
+      file: "C:\\Users\\Alice\\AppData\\Local\\magpie-bun.exe",
+      args: ["build", "--compile", "--windows-hide-console", "C:\\plugin\\mcp-server.mjs", "--outfile", "C:\\tmp\\nc.exe"],
+    },
+  )
+  assert.equal(windowsNcBuild("C:\\Program Files\\nodejs\\node.exe", "C:\\plugin\\mcp-server.mjs", "C:\\tmp\\nc.exe", { node: "22.0.0" }), null)
+  assert.equal(windowsNcBuild("C:\\Program Files\\nodejs\\node.exe", "C:\\plugin\\mcp-server.mjs", "C:\\tmp\\nc.exe", { bun: "1.2.0" }), null)
+})

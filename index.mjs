@@ -1,4 +1,4 @@
-import { agyCandidates, spawnAgy, windowsMcpShim, wslAgyPath, wslDistro, wslMcpShim, wslPath } from "./platform.mjs"
+import { agyCandidates, spawnAgy, windowsMcpShim, windowsNcBuild, wslAgyPath, wslDistro, wslMcpShim, wslPath } from "./platform.mjs"
 import { spawn } from "node:child_process"
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import { once } from "node:events"
@@ -100,7 +100,7 @@ const SUPERSEDED_NOTE = "agy bridge: this tool call was superseded because the c
 const SELF_POLL_IDLE_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_SELF_POLL_IDLE_TIMEOUT_MS, 20 * 60 * 1000)
 const SELF_POLL_LIMIT = positiveTimeout(process.env.AGY_BRIDGE_SELF_POLL_LIMIT, 8)
 const SELF_POLL_NOTE = "agy bridge: gave up waiting for this tool: the client never returned a result for it; stop this turn"
-const TOOL_LIST_WAIT_MS = 5_000
+const TOOL_LIST_WAIT_MS = 20_000
 const STDERR_TAIL = 32 * 1024
 const CONTROL_LINE_LIMIT = 16 * 1024 * 1024
 const ACP_LINE_LIMIT = 64 * 1024 * 1024
@@ -175,6 +175,7 @@ let cachedAgyPath
 let controlServer
 let controlServerPromise
 let shimDir
+let shimDirOwned = false
 let shimDirPromise
 
 function positiveTimeout(value, fallback) {
@@ -827,13 +828,46 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`
 }
 
+function toolsUnlistedError(count, timeoutMs = configuredTimeout("AGY_BRIDGE_TOOL_LIST_WAIT_MS", TOOL_LIST_WAIT_MS)) {
+  const windows = process.platform === "win32" && shimDirOwned
+  const why = windows
+    ? `nc.exe, the program agy runs to reach them, could not be built (${ncBuildFailure || "unknown reason"}), and agy doesn't run the nc.cmd used instead`
+    : `the MCP server agy starts through \`nc\` to reach them didn't answer within ${Math.round(timeoutMs / 1000)}s`
+  const error = new Error(`agy bridge: agy never loaded the request's ${count} tool${count === 1 ? "" : "s"}: ${why}. The model would have seen none of them`)
+  error.statusCode = 502
+  error.code = "tools_not_loaded"
+  return error
+}
+
 // agy connects to --ide-mcp-port by running `nc host port`. A private `nc`
 // earlier in agy's PATH runs the bridge's stdio MCP server instead, so the
 // connection is authenticated by the per-process token in its environment.
-function ensureShimDir() {
+async function ensureShimDir() {
   const distro = wslDistro()
+  if (!distro && shimDir && !shimDirOwned && !await isFileWithBytes(path.join(shimDir, "nc.exe"))) {
+    shimDir = undefined
+    shimDirPromise = null
+  }
+  if (shimDirPromise && !distro && process.platform === "win32" && ncBuildFailure && shimDirOwned &&
+    Date.now() - ncBuildFailedAt >= NC_BUILD_RETRY_MS) {
+    shimDirPromise = null
+  }
   if (shimDirPromise) return shimDirPromise
   shimDirPromise = (async () => {
+    if (!distro && process.platform === "win32") {
+      const shared = await windowsNcDir().catch((error) => {
+        ncBuildFailure = String(error?.message ?? error)
+        return null
+      })
+      if (shared) {
+        ncBuildFailure = ""
+        shimDir = shared
+        shimDirOwned = false
+        return shared
+      }
+      ncBuildFailedAt = Date.now()
+      if (shimDirOwned && shimDir) return shimDir
+    }
     const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "magpie-agy-bridge-bin-"))
     if (distro) {
       await fs.promises.writeFile(path.join(dir, "nc"),
@@ -847,10 +881,107 @@ function ensureShimDir() {
         `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(MCP_SERVER_PATH)}\n`, { mode: 0o700 })
     }
     shimDir = dir
+    shimDirOwned = true
     return dir
   })()
   shimDirPromise.catch(() => { shimDirPromise = null })
   return shimDirPromise
+}
+
+const WINDOWS_NC_PREFIX = "magpie-agy-bridge-nc-"
+const WINDOWS_NC_BUILD_PREFIX = "magpie-agy-bridge-ncbuild-"
+const WINDOWS_NC_BUILD_TIMEOUT_MS = 120_000
+const NC_BUILD_RETRY_MS = 5 * 60 * 1000
+let ncBuildFailure = ""
+let ncBuildFailedAt = 0
+const WINDOWS_NC_RUNTIME_FILE = "runtime"
+
+function asciiPath(value) {
+  return /^[\x20-\x7e]*$/.test(String(value || ""))
+}
+
+async function isFileWithBytes(file) {
+  try {
+    const stat = await fs.promises.stat(file)
+    return stat.isFile() && stat.size > 0
+  } catch {
+    return false
+  }
+}
+
+async function windowsNcDir() {
+  if (!windowsNcBuild(process.execPath, MCP_SERVER_PATH, "nc.exe")) {
+    ncBuildFailure = `${path.win32.basename(String(process.execPath || ""))} is not Bun, which builds it`
+    return null
+  }
+  const tmp = os.tmpdir()
+  const source = await fs.promises.readFile(MCP_SERVER_PATH)
+  const runtimeKey = createHash("sha256").update(String(process.execPath)).update("\0")
+    .update(String(process.versions?.bun || "")).digest("hex").slice(0, 16)
+  const key = createHash("sha256").update(String(process.execPath)).update("\0")
+    .update(String(process.versions?.bun || "")).update("\0").update(source).digest("hex").slice(0, 16)
+  const dir = path.join(tmp, WINDOWS_NC_PREFIX + key)
+  const exe = path.join(dir, "nc.exe")
+  if (await isFileWithBytes(exe)) {
+    const now = new Date()
+    await fs.promises.utimes(exe, now, now).catch(() => {})
+    return dir
+  }
+  const build = await fs.promises.mkdtemp(path.join(tmp, WINDOWS_NC_BUILD_PREFIX))
+  let copy = null
+  let copyBase = null
+  try {
+    let runtime = process.execPath
+    if (!asciiPath(runtime)) {
+      // Bun's compile reads its own path one byte to one UTF-16 unit, so a non-ASCII folder fails with ENOENT.
+      const base = [tmp, process.env.PUBLIC, process.env.ProgramData].find(dir => dir && asciiPath(dir))
+      if (!base) {
+        ncBuildFailure = "Bun is under a non-ASCII folder and there is no ASCII-only folder to copy it to"
+        return null
+      }
+      copyBase = base
+      copy = base === tmp ? build : await fs.promises.mkdtemp(path.join(base, WINDOWS_NC_BUILD_PREFIX))
+      runtime = path.join(copy, path.win32.basename(process.execPath))
+      await fs.promises.copyFile(process.execPath, runtime)
+    }
+    const spec = windowsNcBuild(runtime, MCP_SERVER_PATH, path.join(build, "nc.exe"))
+    const { err, code, timedOut, stdout, stderr } = await execOnce(spec.file, spec.args, { cwd: build, timeoutMs: WINDOWS_NC_BUILD_TIMEOUT_MS })
+    if (err || timedOut || code !== 0 || !await isFileWithBytes(path.join(build, "nc.exe"))) {
+      const said = String(stderr || stdout || err?.message || "").trim().split(/\r?\n/).filter(Boolean).slice(-2).join(" ")
+      ncBuildFailure = `bun build ${timedOut ? `timed out after ${WINDOWS_NC_BUILD_TIMEOUT_MS / 1000}s` : !err && code === 0 ? "wrote no nc.exe" : `exited with ${code ?? "an error"}`}${said ? `: ${said.slice(0, 300)}` : ""}`
+      return null
+    }
+    await fs.promises.mkdir(dir, { recursive: true })
+    await fs.promises.writeFile(path.join(dir, WINDOWS_NC_RUNTIME_FILE), runtimeKey).catch(() => {})
+    try {
+      await fs.promises.rename(path.join(build, "nc.exe"), exe)
+    } catch (error) {
+      if (!await isFileWithBytes(exe)) throw error
+    }
+  } finally {
+    fs.promises.rm(build, { recursive: true, force: true }).catch(() => {})
+    if (copy && copy !== build) fs.promises.rm(copy, { recursive: true, force: true }).catch(() => {})
+  }
+  sweepWindowsNcDirs(tmp, path.basename(dir), runtimeKey).catch(() => {})
+  if (copyBase && copyBase !== tmp) sweepWindowsNcDirs(copyBase, path.basename(dir), runtimeKey).catch(() => {})
+  return dir
+}
+
+async function sweepWindowsNcDirs(tmp, keep, runtimeKey = "") {
+  const now = Date.now()
+  for (const name of await fs.promises.readdir(tmp)) {
+    const shared = name.startsWith(WINDOWS_NC_PREFIX) && /^[0-9a-f]{16}$/.test(name.slice(WINDOWS_NC_PREFIX.length))
+    const build = name.startsWith(WINDOWS_NC_BUILD_PREFIX)
+    if (name === keep || (!shared && !build)) continue
+    const file = path.join(tmp, name)
+    try {
+      const ours = shared && runtimeKey &&
+        await fs.promises.readFile(path.join(file, WINDOWS_NC_RUNTIME_FILE), "utf8").then(v => v === runtimeKey, () => false)
+      const stat = await fs.promises.stat(shared ? path.join(file, "nc.exe") : file).catch(() => fs.promises.stat(file))
+      if (!ours && now - stat.mtimeMs < (shared ? 7 * 24 : 1) * 60 * 60 * 1000) continue
+      await fs.promises.rm(file, { recursive: true, force: true })
+    } catch {}
+  }
 }
 
 function agentDefinition() {
@@ -1594,6 +1725,7 @@ class Proc {
     this.configOptions = Array.isArray(session?.configOptions) ? session.configOptions : []
     if (this.model) await this.#setModel(this.model, this.selection, this.resumed)
     if (this.tools.length) await this.#waitForToolList(this.toolsVersion)
+    if (!this.toolsListed()) throw toolsUnlistedError(this.tools.length)
   }
 
   async #setConfig(config, value) {
@@ -1684,6 +1816,10 @@ class Proc {
       const waiter = { version, resolve, reject, timer: null }
       waiter.timer = setTimeout(() => {
         this.listWaiters = this.listWaiters.filter((item) => item !== waiter)
+        if (this.listedVersion === 0) {
+          reject(toolsUnlistedError(this.tools.length, timeoutMs))
+          return
+        }
         const error = new Error(`agy bridge: agy did not confirm the client tool catalog after ${timeoutMs}ms; no prompt was sent`)
         error.statusCode = 503
         error.code = "tool_list_unconfirmed"
@@ -1691,6 +1827,10 @@ class Proc {
       }, timeoutMs)
       this.listWaiters.push(waiter)
     })
+  }
+
+  toolsListed() {
+    return !this.tools.length || this.listedVersion >= this.toolsVersion
   }
 
   listTools() {
@@ -3318,8 +3458,11 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
       existing.workDir === opts.workDir && sameInstructions(existing.instructions, opts.instructions) &&
       existing.matchesHistory(matchedHistory)
     if (compatible && !(isFreshConversation && existing.hasSentFirstTurn)) {
-      await existing.updateTools(opts.tools)
-      return { proc: existing, history: matchedHistory }
+      if (!opts.tools.length || existing.listedVersion > 0 || existing.watchers.size) {
+        await existing.updateTools(opts.tools)
+        if (existing.toolsListed()) return { proc: existing, history: matchedHistory }
+      }
+      opts.replayReason ||= "tools_unlisted"
     }
     opts.validateReplay?.()
     opts.replayReason ||= existing.dead ? "process_dead"
@@ -6637,7 +6780,7 @@ process.once("exit", () => {
       try { fs.rmSync(proc.workspace, { recursive: true, force: true }) } catch {}
     }
   }
-  if (shimDir) {
+  if (shimDir && shimDirOwned) {
     try { fs.rmSync(shimDir, { recursive: true, force: true }) } catch {}
   }
 })

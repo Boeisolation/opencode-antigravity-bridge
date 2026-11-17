@@ -197,3 +197,8 @@ export function windowsMcpShim(executable, server) {
   }
   return `@echo off\r\nsetlocal DisableDelayedExpansion\r\n${quote(executable)} ${quote(server)}\r\n`
 }
+
+export function windowsNcBuild(runtime, server, outfile, versions = process.versions) {
+  if (!versions?.bun || !/^(?:magpie-)?bun(?:\.exe)?$/i.test(path.win32.basename(String(runtime || "")))) return null
+  return { file: runtime, args: ["build", "--compile", "--windows-hide-console", server, "--outfile", outfile] }
+}

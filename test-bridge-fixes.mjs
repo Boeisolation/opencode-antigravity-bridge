@@ -1058,3 +1058,121 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     }
   }
 })
+
+
+test("unlisted initial tools fail with 502 tools_not_loaded and a no-watcher session is replaced when tools arrive", async () => {
+  const convDir = path.join(root, "conv-unlisted")
+  const accountsDir = path.join(root, "accounts-unlisted")
+  const stateFile = path.join(root, "state-unlisted.json")
+  const fakeDir = path.join(root, "fake-unlisted-agy")
+  fs.mkdirSync(convDir, { recursive: true })
+  fs.mkdirSync(accountsDir, { recursive: true })
+  const markerFile = path.join(root, "unlisted-connect-mcp")
+  const fakeBin = writeFakeAgy(fakeDir, `
+import fs from "node:fs";
+import net from "node:net";
+import readline from "node:readline";
+const args = process.argv.slice(2);
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
+let count = 0;
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+function watchTools() {
+  return new Promise((resolve, reject) => {
+    const port = Number(process.env.AGY_BRIDGE_CONTROL_PORT);
+    const token = process.env.AGY_BRIDGE_TOKEN;
+    const watch = net.createConnection({ host: "127.0.0.1", port }, () => {
+      watch.write(JSON.stringify({ token, kind: "watch" }) + "\\n");
+    });
+    watch.unref();
+    const sock = net.createConnection({ host: "127.0.0.1", port }, () => {
+      sock.write(JSON.stringify({ token, kind: "list" }) + "\\n");
+    });
+    let buf = "";
+    sock.on("data", chunk => {
+      buf += chunk.toString("utf8");
+      const nl = buf.indexOf("\\n");
+      if (nl < 0) return;
+      resolve(JSON.parse(buf.slice(0, nl)));
+      sock.destroy();
+    });
+    sock.on("error", reject);
+  });
+}
+readline.createInterface({ input: process.stdin }).on("line", async line => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } }, agentInfo: { name: "fake-agy", version: "1.5.9" } } });
+  } else if (msg.method === "session/new") {
+    count++;
+    if (fs.existsSync(${JSON.stringify(markerFile)})) await watchTools();
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-unl-" + count + "-" + process.pid } });
+  } else if (msg.method === "session/set_model" || msg.method === "session/set_config_option") {
+    send({ jsonrpc: "2.0", id: msg.id, result: {} });
+  } else if (msg.method === "session/prompt") {
+    const sid = msg.params?.sessionId;
+    send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok:" + sid } } } });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  }
+});
+`)
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+    AGY_BRIDGE_TOOL_LIST_WAIT_MS: process.env.AGY_BRIDGE_TOOL_LIST_WAIT_MS,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = convDir
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  process.env.AGY_BRIDGE_TOOL_LIST_WAIT_MS = "150"
+  const tools = [{ name: "echo", input_schema: { type: "object", properties: { text: { type: "string" } } } }]
+  try {
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-unl=${Date.now()}`)
+    const plugin = await AntigravityBridgePlugin()
+    const loader = await plugin.auth.loader()
+
+    const failRes = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, tools, metadata: { user_id: "u-unl-1" }, messages: [{ role: "user", content: "need tools" }] }),
+    })
+    const failBody = await failRes.json()
+    assert.equal(failRes.status, 502, JSON.stringify(failBody))
+    assert.equal(failBody.error?.code, "tools_not_loaded")
+
+    // First turn starts without tools (and fake agy didn't connect MCP), second turn brings tools -> replaces session cleanly.
+    const r1 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: "u-unl-2" }, messages: [{ role: "user", content: "no tools yet" }] }),
+    })
+    const b1 = await r1.json()
+    assert.equal(r1.status, 200, JSON.stringify(b1))
+    fs.writeFileSync(markerFile, "1")
+    const r2 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        tools,
+        metadata: { user_id: "u-unl-2" },
+        messages: [
+          { role: "user", content: "no tools yet" },
+          { role: "assistant", content: b1.content },
+          { role: "user", content: "now with tools" },
+        ],
+      }),
+    })
+    const b2 = await r2.json()
+    assert.equal(r2.status, 200, JSON.stringify(b2))
+    assert.notEqual(b1.content?.[0]?.text, b2.content?.[0]?.text)
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
