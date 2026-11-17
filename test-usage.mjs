@@ -4,10 +4,11 @@ import { syncBuiltinESMExports } from "node:module"
 import { EventEmitter } from "node:events"
 import { PassThrough } from "node:stream"
 import fs from "node:fs/promises"
+import http from "node:http"
 import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
-import { createUsageReader, fetchUsage, parseUsageReport } from "./usage.mjs"
+import { agyRefusal, createUsageReader, fetchUsage, parseUsageReport, quotaUserAgent, readQuotaDirect, verifyLinkIn, verifyRefused } from "./usage.mjs"
 import { catalogRows, modelsInGroup, storeCatalogRows } from "./model-ids.mjs"
 import { agySpawnSpec } from "./platform.mjs"
 import { forgetStoredSignIn } from "./signin.mjs"
@@ -897,4 +898,259 @@ test("modelsInGroup matches catalog display names, handles missing commas, and i
   assert.deepEqual(modelsInGroup({ description: "Models within this group: Model One and Model Two" }), ["m1", "m2"])
   storeCatalogRows([{ id: "a-high", name: "Twin (High)", effort: "high" }, { id: "b", name: "Twin" }, { id: "c", name: "Solo" }])
   assert.deepEqual(modelsInGroup({ description: "Models within this group: Twin, Solo" }), ["c"])
+})
+
+const REFUSED = JSON.stringify({
+  conversation_id: "", status: "ERROR", response: "",
+  error: "Eligibility check failed: Your current account is not eligible for Antigravity, because it is not currently available in your location.",
+  duration_seconds: 0, num_turns: 0,
+  usage: { input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, thinking_tokens: 0 },
+  finished_reason: "error",
+})
+const LOAD = {
+  allowedTiers: [{ id: "free-tier", name: "Antigravity", isDefault: true }],
+  ineligibleTiers: [{ reasonCode: "UNSUPPORTED_LOCATION", reasonMessage: "Your current account is not eligible for Antigravity, because it is not currently available in your location." }],
+  cloudaicompanionProject: "aicode-consumers",
+}
+const SUMMARY = {
+  groups: [{
+    displayName: "Gemini Models",
+    description: "Models within this group: Gemini 4 Hydrogen, Gemini 3.8 Flash",
+    buckets: [
+      { bucketId: "gemini-weekly", displayName: "Weekly Limit Remaining", window: "weekly", resetTime: "2026-11-22T11:19:33Z", remainingFraction: 0.75 },
+      { bucketId: "gemini-5h", displayName: "Five Hour Limit Remaining", window: "5h", resetTime: "2026-11-16T16:19:33Z", remainingFraction: 0.5 },
+    ],
+  }],
+}
+const STORED = { token: { access_token: "ya29.live", refresh_token: "1//refresh", expiry: "0001-01-01T00:00:00Z", token_type: "Bearer" }, auth_method: "consumer", id_token_email: "secret@example.com" }
+
+async function codeAssist(t, answer = {}) {
+  const calls = []
+  const server = http.createServer((req, res) => {
+    let body = ""
+    req.on("data", c => { body += c })
+    req.on("end", () => {
+      calls.push({ method: req.method, url: req.url, headers: req.headers, body: JSON.parse(body || "null") })
+      const name = req.url.replace(/^\/v1internal:/, "")
+      const [status, reply] = answer[name] ?? [200, name === "loadCodeAssist" ? LOAD : SUMMARY]
+      res.writeHead(status, { "Content-Type": "application/json" })
+      res.end(JSON.stringify(reply))
+    })
+  })
+  await new Promise(r => server.listen(0, "127.0.0.1", r))
+  t.after(() => new Promise(r => server.close(r)))
+  return { url: `http://127.0.0.1:${server.address().port}`, calls }
+}
+
+test("region-refused accounts fall back to direct Code Assist quota reads", async t => {
+  const api = await codeAssist(t)
+  const f = await fixture(t, { TEST_MODE: "fail", TEST_ERROR: "", TEST_FAILURE_REPORT: REFUSED, TEST_VERSION: "1.5.9", CLOUD_CODE_URL: api.url })
+  const quota = o => readQuotaDirect({ ...o, stored: async () => STORED })
+  const result = await createUsageReader(() => f.executable, { ...f.options, quota })()
+  assert.equal(result.error, undefined)
+  assert.equal(result.signIn, "kept")
+  assert.deepEqual(result.windows.map(w => [w.name, w.used, w.resetsAt]), [
+    ["Gemini · 7 days", 25, "2026-11-22T11:19:33.000Z"],
+    ["Gemini · 5 hours", 50, "2026-11-16T16:19:33.000Z"],
+  ])
+  assert.deepEqual(api.calls.map(c => [c.method, c.url, c.body]), [
+    ["POST", "/v1internal:loadCodeAssist", { metadata: { ideType: "ANTIGRAVITY" } }],
+    ["POST", "/v1internal:retrieveUserQuotaSummary", { project: "aicode-consumers" }],
+  ])
+  for (const c of api.calls) {
+    assert.equal(c.headers.authorization, "Bearer ya29.live")
+    assert.equal(c.headers["content-type"], "application/json")
+    assert.equal(c.headers["user-agent"], quotaUserAgent("1.5.9", "consumer"))
+  }
+  await f.assertClean()
+})
+
+test("quotaUserAgent formats platform and arch like agy", () => {
+  assert.equal(quotaUserAgent("1.5.9", "consumer", "darwin", "arm64"),
+    "antigravity/cli/1.5.9 (aidev_client; os_type=darwin; arch=arm64; cl=1021519450; auth_method=consumer)")
+  assert.match(quotaUserAgent("1.6.0", "", "win32", "x64"), /^antigravity\/cli\/1\.6\.0 \(aidev_client; os_type=windows; arch=amd64; cl=\d+; auth_method=consumer\)$/)
+})
+
+test("readQuotaDirect renews expiring access tokens in memory without writing stored credentials", async t => {
+  const api = await codeAssist(t)
+  const renewals = []
+  const fetchFn = async (url, init) => {
+    if (String(url).startsWith("https://oauth2.googleapis.com/token")) {
+      renewals.push(Object.fromEntries(new URLSearchParams(init.body)))
+      return new Response(JSON.stringify({ access_token: "ya29.fresh", expires_in: 3599 }), { status: 200 })
+    }
+    return fetch(url, init)
+  }
+  const ending = structuredClone(STORED)
+  ending.token.expiry = new Date(Date.now() + 30_000).toISOString()
+  const data = await readQuotaDirect({ env: { CLOUD_CODE_URL: api.url }, version: "1.5.9", deadline: Date.now() + 5000, stored: async () => ending, fetch: fetchFn })
+  assert.deepEqual(data, SUMMARY)
+  assert.equal(renewals.length, 1)
+  assert.equal(renewals[0].grant_type, "refresh_token")
+  assert.equal(renewals[0].refresh_token, "1//refresh")
+  assert.ok(api.calls.every(c => c.headers.authorization === "Bearer ya29.fresh"))
+  assert.equal(ending.token.access_token, "ya29.live")
+})
+
+test("direct quota reads isolate mock agy from host credentials and scope named accounts", async t => {
+  const api = await codeAssist(t)
+  const f = await fixture(t, { TEST_MODE: "fail", TEST_ERROR: "", TEST_FAILURE_REPORT: REFUSED, TEST_VERSION: "1.5.9", CLOUD_CODE_URL: api.url })
+  // Even without AGY_BRIDGE_STORED_SIGNIN=skip, a mock agy without geminiDir must not read host keychain.
+  const noSkipEnv = { ...f.options.env }
+  delete noSkipEnv.AGY_BRIDGE_STORED_SIGNIN
+  await assert.rejects(fetchUsage(f.executable, { ...f.options, env: noSkipEnv }), /not eligible/)
+  assert.equal(api.calls.length, 0)
+
+  const accountDir = path.join(f.env.TEST_DESCENDANT + "-acct")
+  t.after(() => fs.rm(accountDir, { recursive: true, force: true }))
+  await fs.mkdir(path.join(accountDir, "antigravity-cli"), { recursive: true })
+  await fs.writeFile(path.join(accountDir, "antigravity-cli", "antigravity-oauth-token"), JSON.stringify(STORED))
+  const namedResult = await fetchUsage(f.executable, { ...f.options, env: noSkipEnv, geminiDir: accountDir })
+  assert.equal(namedResult.windows.length, 2)
+  assert.equal(api.calls.length, 2)
+  assert.ok(api.calls.every(c => c.headers.authorization === "Bearer ya29.live"))
+  await f.assertClean()
+})
+
+test("failed direct quota read leaves region refusal standing without zeroing limits", async t => {
+  for (const [answer, stored] of [
+    [{ retrieveUserQuotaSummary: [403, { error: { code: 403, message: "secret@example.com" } }] }, STORED],
+    [{ loadCodeAssist: [200, { ...LOAD, cloudaicompanionProject: undefined }] }, STORED],
+    [{ retrieveUserQuotaSummary: [200, { groups: [] }] }, STORED],
+    [{}, null],
+  ]) {
+    const api = await codeAssist(t, answer)
+    const f = await fixture(t, { TEST_MODE: "fail", TEST_ERROR: "", TEST_FAILURE_REPORT: REFUSED, TEST_VERSION: "1.5.9", CLOUD_CODE_URL: api.url })
+    const quota = o => readQuotaDirect({ ...o, stored: async () => stored })
+    const result = await createUsageReader(() => f.executable, { ...f.options, quota })()
+    assert.deepEqual(result.windows, [])
+    assert.equal(result.signIn, "kept")
+    assert.match(result.error, /not eligible/)
+    assert.doesNotMatch(result.error, /secret/)
+  }
+})
+
+test("expired or expiring renewable tokens query quota directly without running agy -p", async t => {
+  for (const ends of [1, 1_000_000 + 60_000]) {
+    const f = await fixture(t, { TEST_VERSION: "1.5.9" })
+    const asked = []
+    const quota = async o => { asked.push(o.version); return SUMMARY }
+    const stored = { state: "present", fp: "ended", canRenew: true, expiresAt: ends, expired: ends === 1 }
+    const read = createUsageReader(() => f.executable, { ...f.options, quota, now: () => 1_000_000, signIn: async () => stored })
+    const result = await read()
+    assert.equal(result.error, undefined)
+    assert.equal(result.signIn, "kept")
+    assert.equal(result.windows.length, 2)
+    assert.deepEqual(asked, ["1.5.9"])
+    assert.deepEqual((await f.logs()).map(l => l.args.find(a => !a.startsWith("--gemini_dir="))), ["--version"])
+    await f.assertClean()
+  }
+  const f = await fixture(t)
+  let asked = 0
+  const stored = { state: "present", fp: "live", canRenew: true, expiresAt: 1_000_000 + 10 * 60_000, expired: false }
+  const read = createUsageReader(() => f.executable, { ...f.options, quota: async () => { asked++; return SUMMARY }, now: () => 1_000_000, signIn: async () => stored })
+  assert.equal((await read()).windows.length, 1)
+  assert.equal(asked, 0)
+  assert.deepEqual((await f.logs()).map(l => l.args.find(a => !a.startsWith("--gemini_dir="))), ["--version", "-p"])
+})
+
+test("direct renewal marks invalid_grant as dead auth while transient errors keep sign-in", async t => {
+  forgetStoredSignIn({ dead: true })
+  t.after(() => forgetStoredSignIn({ dead: true }))
+  const f = await fixture(t)
+  let fail = () => { throw new TypeError("fetch failed: getaddrinfo ENOTFOUND oauth2.googleapis.com") }
+  const stored = { state: "present", fp: "blip", canRenew: true, expiresAt: 1, expired: true }
+  const read = createUsageReader(() => f.executable, { ...f.options, quota: async () => fail(), now: () => 1_000_000, signIn: async () => stored })
+  const first = await read()
+  assert.equal(first.signIn, "kept")
+  assert.match(first.error, /network or proxy/)
+  fail = () => SUMMARY
+  const back = await read()
+  assert.equal(back.windows.length, 2)
+  assert.equal(back.signIn, "kept")
+  assert.ok((await f.logs()).every(l => l.args.includes("--version")), "agy -p never ran")
+
+  const revoked = { ...stored, fp: "revoked" }
+  const api = async () => new Response(JSON.stringify({ error: "invalid_grant", error_description: "Token has been expired or revoked." }), { status: 400 })
+  const ended = structuredClone(STORED)
+  ended.token.expiry = new Date(Date.now() - 60_000).toISOString()
+  const read2 = createUsageReader(() => f.executable, {
+    ...f.options, now: () => 1_000_000, signIn: async () => revoked,
+    quota: o => readQuotaDirect({ ...o, stored: async () => ended, fetch: api }),
+  })
+  const over = await read2()
+  assert.equal(over.signIn, "expired")
+  assert.match(over.error, /no longer works/)
+  assert.equal((await read2()).signIn, "expired")
+  await f.assertClean()
+
+  for (const [status, body, kind] of [
+    [400, { error: "invalid_grant" }, "auth"],
+    [401, { error: "invalid_grant" }, "auth"],
+    [400, { error: "invalid_request" }, null],
+    [503, { error: "backendError" }, null],
+    [500, "not json", null],
+  ]) {
+    const fetchFn = async () => new Response(typeof body === "string" ? body : JSON.stringify(body), { status })
+    await assert.rejects(readQuotaDirect({ env: {}, version: "1.5.9", deadline: Date.now() + 5000, stored: async () => ended, fetch: fetchFn }),
+      e => e.kind === kind && /sign-in/.test(e.message), `${status} ${JSON.stringify(body)}`)
+  }
+})
+
+test("only non-network eligibility refusals fall back to direct quota reads", async t => {
+  for (const error of [
+    "Eligibility check failed: EOF",
+    "Authentication required",
+    "quota request timed out",
+  ]) {
+    let asked = 0
+    const f = await fixture(t, { TEST_MODE: "fail", TEST_ERROR: "", TEST_FAILURE_REPORT: JSON.stringify({ status: "ERROR", error }) })
+    const result = await createUsageReader(() => f.executable, { ...f.options, quota: async () => { asked++; return SUMMARY } })()
+    assert.deepEqual(result.windows, [])
+    assert.equal(asked, 0, error)
+  }
+})
+
+test("agyRefusal detects #3501, disabled accounts, region refusals, and ignores diagnostics or network failures", () => {
+  const license = "Error: Eligibility check failed: PERMISSION_DENIED (code 403): You do not have a valid license of this product. ... (#3501). Please log out (/logout) and log back in (/login)."
+  const disabled = "PERMISSION_DENIED (code 403): This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product."
+  assert.match(agyRefusal(license), /#3501/)
+  assert.match(agyRefusal("error: something (#3501)"), /#3501/)
+  assert.match(agyRefusal(disabled), /disabled this account's access[\s\S]*Terms of Service[\s\S]*appeal/)
+  assert.match(agyRefusal(disabled.replace(" This service", "\nThis service")), /disabled this account's access/)
+  assert.match(agyRefusal("Error: Eligibility check failed: Your current account is not eligible for Antigravity, because it is not currently available in your location."), /not currently available in your location[\s\S]*VPN/)
+  for (const other of [
+    "",
+    "Error: Eligibility check failed: EOF",
+    "Error: Eligibility check failed: dial tcp: lookup cloudcode-pa.googleapis.com: no such host",
+    "Error: You are not logged into Antigravity.",
+    "E1116 10:34:12.084405     248 errorreport.go:307] Failed to poll ListExperiments: PERMISSION_DENIED (code 403): You do not have a valid license of this product. (#3501)\nError: something else",
+    "PERMISSION_DENIED (code 403): Request had invalid credentials.",
+    "This service has been disabled in this account for violation of Terms of Service.",
+  ]) assert.equal(agyRefusal(other), "", other)
+})
+
+test("agyRefusal, verifyLinkIn, and verifyRefused surface verification advice and links", () => {
+  const link = "https://accounts.google.com/signin/continue?sarp=1&scc=1&continue=https://developers.google.com/gemini-code-assist/auth/auth_success_gemini&plt=AKgnsbv"
+  const linked = `Error: Eligibility check failed: Verify your account to continue.\n\nPlease verify your account in your browser to continue:\n${link}\n`
+  const said = agyRefusal(linked)
+  assert.ok(said.includes(`this Google account needs to be verified: open ${link} in a browser`), said)
+  assert.doesNotMatch(said, /VPN/)
+  assert.equal(verifyLinkIn(linked.replace(/\n/g, "\r\n")), link)
+  assert.equal(verifyRefused(link), said)
+  for (const bare of [
+    "Error: Eligibility check failed: Verification required. Please complete verification in your browser to continue.",
+    "Error: Eligibility check failed: Verify your account to continue.",
+  ]) {
+    const why = agyRefusal(bare)
+    assert.match(why, /this Google account needs to be verified: open the Antigravity app, or run `agy` in a terminal/, bare)
+    assert.doesNotMatch(why, /https:/)
+    assert.equal(verifyRefused(""), why)
+  }
+
+  const body = '{"error":{"code":403,"message":"Verify your account to continue.","status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"VALIDATION_REQUIRED","metadata":{"validation_url":"https://accounts.google.com/signin/continue?sarp=1\\u0026x=2","validation_link":"https://accounts.google.com/v?a=1\\u0026b=2"}}]}}'
+  assert.equal(verifyLinkIn(body), "https://accounts.google.com/v?a=1&b=2")
+  assert.equal(verifyLinkIn(body.replace(/,"validation_link":"[^"]+"/, "")), "https://accounts.google.com/signin/continue?sarp=1&x=2")
+  assert.equal(verifyLinkIn('validation_url: "http://example.com/x"'), "")
+  assert.equal(verifyLinkIn("Verification Required"), "")
 })
