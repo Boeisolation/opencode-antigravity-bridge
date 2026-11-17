@@ -1,5 +1,5 @@
 // Adapted from magpie-community/plugins agy-cli (b829a5541ecc0790b05a63308447bf87e952efbe,
-// 5bb4194, 0.1.55, and 0.1.64). MIT; Copyright (c) 2026 DylanLIiii, gitxm, yce.
+// 5bb4194, 0.1.55, 0.1.64, and 0.1.88). MIT; Copyright (c) 2026 DylanLIiii, gitxm, yce.
 // See NOTICE-upstream-license.txt.
 //
 // Antigravity may reject these prompt phrases regardless of quota.
@@ -29,6 +29,7 @@ export const TURNED_AWAY = [
   CLAUDE_CODE_SECURITY.toLowerCase(),
   CLAUDE_CODE_PASTED.toLowerCase(),
   "you are a coding assistant running inside pi-bolt",
+  "the browser provides no implicit dom, route, or screenshot context.",
 ]
 
 export const USER_TURNED_AWAY = TURNED_AWAY.filter((line) => line.startsWith("you are codex, "))
@@ -88,6 +89,7 @@ const SAID_AS = [
   () => CLAUDE_CODE_SECURITY_SAID,
   () => CLAUDE_CODE_PASTED_SAID,
   (line) => line.replace(/pi-bolt$/i, "a tool"),
+  (line) => line.replace(/provides/i, "gives"),
 ]
 
 function isBillingFields(text) {
@@ -202,7 +204,7 @@ const CODEX_CLI_HINT =
   "Antigravity answers this 429 to Codex's prompt for a model it has none of its own for (\"You are a coding agent running in the Codex CLI\") whatever quota is left, so it is not a quota and waiting won't help; magpie sends that line as \"You're …\", which goes through, so use another provider for these chats, or put one after Antigravity in a routing group"
 
 const DSH_HINT =
-  "Antigravity answers this 429 to DeepSeek Harness's system prompt (\"You are an AI agent powered by DeepSeek Harness.\") whatever quota is left, so it is not a quota and waiting won't help; magpie sends that line as \"You're …\", which goes through, so use another provider for these chats, or put one after Antigravity in a routing group"
+  "Antigravity answers this 429 to DeepSeek Harness's system prompt (\"You are an AI agent powered by DeepSeek Harness.\", or \"The browser provides no implicit DOM, route, or screenshot context.\" in its Web GUI's) whatever quota is left, so it is not a quota and waiting won't help; magpie sends those lines as \"You're …\" and \"The browser gives …\", which go through, so use another provider for these chats, or put one after Antigravity in a routing group"
 
 const RFC_HINT =
   "Antigravity answers this 429 to the line \"RFC 2119 keywords: MUST, REQUIRED, SHOULD, RECOMMENDED, MAY, OPTIONAL.\" that starts oh-my-pi (omp)'s system prompt, and to any prompt that has it, whatever quota is left, so it is not a quota and waiting won't help; magpie sends that line as \"RFC 2119 key words: …\", so this one came from a copy of it that was worded another way"
@@ -215,6 +217,6 @@ export function hint(system) {
   if (normalized.includes("you are hermes agent") || normalized.includes("an intelligent ai assistant created by nous research")) return HERMES_HINT
   if (normalized.includes("you are opencode")) return OPENCODE_HINT
   if (normalized.includes("a coding assistant running inside pi")) return PI_HINT
-  if (normalized.includes("you are an ai agent powered by deepseek harness")) return DSH_HINT
+  if (normalized.includes("you are an ai agent powered by deepseek harness") || normalized.includes("the browser provides no implicit dom, route, or screenshot context.")) return DSH_HINT
   return HINT
 }
