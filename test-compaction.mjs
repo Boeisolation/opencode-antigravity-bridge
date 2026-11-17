@@ -71,3 +71,30 @@ test("small compactions stay one prompt; excessive fragment counts reject withou
     error.code === "prompt_budget_exceeded" && error.noRetry && error.statusCode === 400)
   assert.throws(() => compactionPrompts([{ type: "text", text: "x".repeat(1000) }], 100), /fragment budget/)
 })
+
+const claudeAsk = "Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions."
+const claudeCritical = "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n" + claudeAsk
+
+test("recognize Claude Code compaction prompts (standalone, critical preamble, pending question, coalesced)", () => {
+  for (const prompt of [
+    claudeAsk,
+    claudeCritical,
+    "What is 17 times 23?\n\n" + claudeAsk,
+    "What is 17 times 23?\n\n" + claudeCritical,
+  ]) {
+    assert.equal(openCodeCompactionStart([user("history"), user(prompt)]), 1)
+    assert.equal(openCodeCompactionStart([user("history"), user([{ type: "text", text: prompt }])]), 1)
+  }
+  assert.equal(openCodeCompactionStart([user([{ type: "tool_result", tool_use_id: "t", content: "ok" }, { type: "text", text: claudeCritical }])]), 0)
+})
+
+test("quoted or single-message Claude Code compaction markers never enable staging", () => {
+  for (const messages of [
+    [user(claudeAsk)],
+    [user("history"), user("Explain this example:\n" + claudeAsk)],
+    [user("history"), user("history\nYour task is to create a detailed summary of the conversation so far — what does this line mean?")],
+    [user("history"), user(claudeAsk), user("Continue work")],
+    [user("history"), user([{ type: "tool_result", tool_use_id: "t", content: claudeAsk }])],
+    [user("history"), { role: "assistant", content: claudeAsk }],
+  ]) assert.equal(openCodeCompactionStart(messages), -1)
+})
