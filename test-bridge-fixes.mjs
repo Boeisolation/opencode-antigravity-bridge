@@ -96,6 +96,7 @@ test("CloudCode model metadata sets real context, output, image capabilities, an
   const fakeDir = path.join(root, "fake-cloud-agy")
   const fakeBin = writeFakeAgy(fakeDir, `
 const args = process.argv.slice(2);
+if (args.includes("--help")) process.exit(0);
 if (args.includes("models")) {
   console.log([
     "gemini-3.8-flash-low Gemini 3.8 Flash (low)",
@@ -218,6 +219,7 @@ test("silent failures and 0-model-step SQLite errors never return fake HTTP 200"
 import fs from "node:fs";
 import path from "node:path";
 const args = process.argv.slice(2);
+if (args.includes("--help")) process.exit(0);
 if (args.includes("models")) {
   console.log("gemini-test-medium Gemini Test (medium)");
   process.exit(0);
@@ -360,6 +362,7 @@ import fs from "node:fs";
 import readline from "node:readline";
 const args = process.argv.slice(2);
 const logFile = process.env.FAKE_TS_LOG;
+if (args.includes("--help")) process.exit(0);
 if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
 if (args.includes("models")) {
   if (process.env.FAKE_MODELS_FAIL === "1") process.exit(1);
@@ -490,6 +493,7 @@ import readline from "node:readline";
 const args = process.argv.slice(2);
 const logFile = process.env.FAKE_WAIT_LOG;
 const record = (entry) => fs.appendFileSync(logFile, JSON.stringify(entry) + "\\n");
+if (args.includes("--help")) process.exit(0);
 if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
 if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
 const sessionId = "s-wait";
@@ -676,6 +680,7 @@ test("disabled account ToS notice never leaks as assistant text and emits 403 pe
   const fakeBin = writeFakeAgy(fakeDir, `
 import readline from "node:readline";
 const args = process.argv.slice(2);
+if (args.includes("--help")) process.exit(0);
 if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
 if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
 let count = 0;
@@ -778,6 +783,7 @@ import net from "node:net";
 import readline from "node:readline";
 const args = process.argv.slice(2);
 const logFile = process.env.FAKE_WARM_LOG;
+if (args.includes("--help")) process.exit(0);
 if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
 if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
 const pidTag = process.pid;
@@ -973,6 +979,7 @@ test("Individual quota reached maps to 429 with reset time and Verification Requ
 import fs from "node:fs";
 import readline from "node:readline";
 const args = process.argv.slice(2);
+if (args.includes("--help")) process.exit(0);
 if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
 if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
 const logIdx = args.indexOf("--log-file");
@@ -1073,6 +1080,7 @@ import fs from "node:fs";
 import net from "node:net";
 import readline from "node:readline";
 const args = process.argv.slice(2);
+if (args.includes("--help")) process.exit(0);
 if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
 if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
 let count = 0;
@@ -1169,6 +1177,97 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
     const b2 = await r2.json()
     assert.equal(r2.status, 200, JSON.stringify(b2))
     assert.notEqual(b1.content?.[0]?.text, b2.content?.[0]?.text)
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
+
+
+test("agy launch flags probe --help once per binary for --settings, --include-default-customizations=false, and --disable-telemetry", async () => {
+  const convDir = path.join(root, "conv-flags")
+  const accountsDir = path.join(root, "accounts-flags")
+  const stateFile = path.join(root, "state-flags.json")
+  const fakeDir = path.join(root, "fake-flags-agy")
+  const logFile = path.join(root, "flags.jsonl")
+  fs.mkdirSync(convDir, { recursive: true })
+  fs.mkdirSync(accountsDir, { recursive: true })
+  const fakeBin = writeFakeAgy(fakeDir, `
+import fs from "node:fs";
+import readline from "node:readline";
+const args = process.argv.slice(2);
+const log = (entry) => fs.appendFileSync(${JSON.stringify(logFile)}, JSON.stringify(entry) + "\\n");
+if (args.length === 1 && args[0] === "--help") {
+  log({ type: "top-help" });
+  console.log("Usage:\\n  --settings string   override settings");
+  process.exit(0);
+}
+if (args[0] === "acp" && args.includes("--help")) {
+  log({ type: "acp-help" });
+  console.log("Usage of acp:\\n  --include-default-customizations\\n  --disable-telemetry");
+  process.exit(0);
+}
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+if (args.includes("models")) {
+  log({ type: "models", args });
+  console.log("gemini-test  Gemini Test");
+  process.exit(0);
+}
+log({ type: "acp", args });
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+readline.createInterface({ input: process.stdin }).on("line", line => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } }, agentInfo: { name: "fake-agy", version: "1.5.9" } } });
+  else if (msg.method === "session/new") send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-flags" } });
+  else if (msg.method === "session/set_model" || msg.method === "session/set_config_option") send({ jsonrpc: "2.0", id: msg.id, result: {} });
+  else if (msg.method === "session/prompt") {
+    send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: msg.params?.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } } } });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  }
+});
+`)
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+    AGY_BRIDGE_TELEMETRY: process.env.AGY_BRIDGE_TELEMETRY,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = convDir
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  delete process.env.AGY_BRIDGE_TELEMETRY
+  try {
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-flags=${Date.now()}`)
+    const plugin = await AntigravityBridgePlugin()
+    const loader = await plugin.auth.loader()
+    const r1 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: "u-flags-1" }, messages: [{ role: "user", content: "hi" }] }),
+    })
+    assert.equal(r1.status, 200)
+    process.env.AGY_BRIDGE_TELEMETRY = "1"
+    const r2 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: "u-flags-2" }, messages: [{ role: "user", content: "hi2" }] }),
+    })
+    assert.equal(r2.status, 200)
+    const events = fs.readFileSync(logFile, "utf8").trim().split("\n").map(JSON.parse)
+    assert.equal(events.filter(e => e.type === "top-help").length, 1)
+    assert.equal(events.filter(e => e.type === "acp-help").length, 1)
+    const modelsCall = events.find(e => e.type === "models")
+    assert.deepEqual(modelsCall.args, ["--settings", JSON.stringify({ modelProvider: "" }), "models"])
+    const acpCalls = events.filter(e => e.type === "acp")
+    assert.equal(acpCalls.length, 2)
+    assert.ok(acpCalls[0].args.includes("--include-default-customizations=false"))
+    assert.ok(acpCalls[0].args.includes("--disable-telemetry"))
+    assert.ok(acpCalls[1].args.includes("--include-default-customizations=false"))
+    assert.ok(!acpCalls[1].args.includes("--disable-telemetry"))
   } finally {
     for (const [k, v] of Object.entries(prev)) {
       if (v === undefined) delete process.env[k]

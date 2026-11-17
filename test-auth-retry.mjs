@@ -55,6 +55,8 @@ const log = (v) => fs.appendFileSync(process.env.FAKE_E2E_LOG, JSON.stringify(v)
 const send = (v) => process.stdout.write(JSON.stringify(v) + "\n")
 const stateFile = (name) => path.join(process.env.FAKE_E2E_STATE, name)
 
+if (argv.includes("--help")) process.exit(0)
+
 if (argv.includes("--version")) {
   process.stdout.write("1.5.1\n")
   process.exit(0)

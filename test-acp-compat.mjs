@@ -17,6 +17,7 @@ import readline from "node:readline"
 const mode = process.env.COMPAT_MODE
 const log = event => fs.appendFileSync(process.env.COMPAT_LOG, JSON.stringify({ mode, pid: process.pid, ...event }) + "\n")
 const send = value => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...value }) + "\n")
+if (process.argv.includes("--help")) process.exit(0)
 if (process.argv.includes("--version")) { console.log("1.5.4"); process.exit(0) }
 if (process.argv.includes("models")) { console.log("gemini-test-high\tTest High"); process.exit(0) }
 log({ kind: "spawn" })

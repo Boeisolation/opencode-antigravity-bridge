@@ -52,6 +52,7 @@ const scope = dir ? path.basename(dir) : "default"
 const cfg = JSON.parse(fs.readFileSync(process.env.FAKE_CONFIG, "utf8"))[scope] || {}
 const log = event => fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify({ ...event, scope, pid: process.pid, at: Date.now() }) + "\n")
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms || 0))
+if (args.includes("--help")) process.exit(0)
 if (args.includes("--version")) { console.log("1.5.7"); process.exit(0) }
 if (args.includes("models")) {
   log({ type: "models-start" })

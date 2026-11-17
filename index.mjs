@@ -255,9 +255,10 @@ function execOnce(file, args, opts = {}) {
     let child
     try {
       const launch = file === "taskkill" ? spawn : spawnAgy
+      const { unrefTimer, ...spawnOpts } = opts
       child = launch(file, args, {
         stdio: ["ignore", "pipe", "pipe"],
-        ...opts,
+        ...spawnOpts,
         windowsHide: true,
       })
     } catch (err) {
@@ -271,6 +272,7 @@ function execOnce(file, args, opts = {}) {
       timedOut = true
       try { child.kill("SIGKILL") } catch {}
     }, opts.timeoutMs ?? 30_000)
+    if (opts.unrefTimer) timer.unref?.()
     child.stdout.on("data", (data) => { stdout += data })
     child.stderr.on("data", (data) => { stderr += data })
     child.on("error", (err) => {
@@ -284,6 +286,42 @@ function execOnce(file, args, opts = {}) {
   })
 }
 
+const helpProbeCache = new Map()
+function helpProbe(agyPath, cacheKey, args, unrefTimer = false) {
+  let key = `${wslDistro() || "native"}|${cacheKey}|${agyPath}`
+  try {
+    const st = fs.statSync(agyPath)
+    key += `\0${st.mtimeMs}\0${st.size}`
+  } catch {}
+  let probe = helpProbeCache.get(key)
+  if (!probe) {
+    probe = execOnce(agyPath, args, { timeoutMs: 10_000, unrefTimer }).then(({ err, stdout, stderr, timedOut }) => {
+      if (err || timedOut) helpProbeCache.delete(key)
+      return stdout + stderr
+    })
+    helpProbeCache.set(key, probe)
+  }
+  return probe
+}
+
+const MODELS_SETTINGS = JSON.stringify({ modelProvider: "" })
+
+async function modelsArgs(agyPath, extraArgs = []) {
+  const help = await helpProbe(agyPath, "top", ["--help"], true)
+  return /^\s*--settings\b/m.test(help) ? ["--settings", MODELS_SETTINGS, ...extraArgs, "models"] : [...extraArgs, "models"]
+}
+
+async function noDefaultCustomizationsArgs(agyPath) {
+  const help = await helpProbe(agyPath, "acp", ["acp", "--help"])
+  return /--include-default-customizations\b/.test(help) ? ["--include-default-customizations=false"] : []
+}
+
+async function telemetryArgs(agyPath, env = process.env) {
+  if (/^(?:1|true|on|yes|enabled)$/i.test(env.AGY_BRIDGE_TELEMETRY || "")) return []
+  const help = await helpProbe(agyPath, "acp", ["acp", "--help"])
+  return /--disable[-_]telemetry\b/.test(help) ? ["--disable-telemetry"] : []
+}
+
 // agy normally prefers the machine-global OS keyring, which every account
 // shares. Named accounts must read their own file token instead. WSL detection
 // is the CLI's file-storage switch, so pin it for account children; a real WSL
@@ -295,7 +333,7 @@ function accountEnv(env, geminiDir) {
 
 async function listAgyModels(agyPath, extraArgs = []) {
   const geminiDir = extraArgs.find(arg => arg.startsWith("--gemini_dir="))?.slice("--gemini_dir=".length)
-  const { err, stdout, stderr, code } = await execOnce(agyPath, [...extraArgs, "models"], {
+  const { err, stdout, stderr, code } = await execOnce(agyPath, await modelsArgs(agyPath, extraArgs), {
     timeoutMs: 15_000,
     env: accountEnv(process.env, geminiDir),
   })
@@ -389,7 +427,8 @@ async function runOfferedProbe(agyPath, account) {
   let workspace, child, conn
   try {
     workspace = await fs.promises.mkdtemp(path.join(os.tmpdir(), "agy-model-probe-"))
-    const args = ["acp", ...(account.dir ? [`--gemini_dir=${account.dir}`] : [])]
+    const args = ["acp", ...(account.dir ? [`--gemini_dir=${account.dir}`] : []),
+      ...await noDefaultCustomizationsArgs(agyPath), ...await telemetryArgs(agyPath)]
     child = spawnAgy(agyPath, args, { cwd: workspace, stdio: ["pipe", "pipe", "pipe"], windowsHide: true, detached: process.platform !== "win32",
       env: { ...accountEnv({ ...process.env }, account.dir), AGY_CLI_DISABLE_AUTO_UPDATE: "true" } })
     child.stderr?.resume()
@@ -1606,6 +1645,7 @@ class Proc {
     // A named account pins this process to its own Gemini dir (own OAuth token).
     if (this.geminiDir) args.push(`--gemini_dir=${this.geminiDir}`)
     if (this.workDir) args.push("--add-dir", agentPath(this.workDir))
+    args.push(...await noDefaultCustomizationsArgs(this.agyPath), ...await telemetryArgs(this.agyPath))
     try {
       const childEnv = accountEnv({ ...process.env }, this.geminiDir)
       const inheritedPath = process.env.PATH || childEnv.Path || ""
@@ -6239,7 +6279,7 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                 error: cachedAgyError || `agy CLI not found. Update magpie and try again to have it installed, or install Antigravity CLI yourself: ${AGY_MANUAL} — then run \`agy\` once to sign in.`,
               }
             }
-            const probe = await execOnce(agy, ["models"], { timeoutMs: 15_000 })
+            const probe = await execOnce(agy, await modelsArgs(agy), { timeoutMs: 15_000 })
             if (probe.err || probe.code !== 0 || !probe.stdout.trim()) {
               const why = probe.timedOut
                 ? "timed out after 15s"
@@ -6270,7 +6310,7 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
               const account = nativeAccount({ type: "api", key: result.key })
               const agy = findAgy()
               if (!agy) return { type: "failed", error: "agy CLI not found. Install the CLI before registering this account." }
-              const probe = await execOnce(agy, [`--gemini_dir=${account.dir}`, "models"], { timeoutMs: 15_000, env: accountEnv(process.env, account.dir), signal })
+              const probe = await execOnce(agy, await modelsArgs(agy, [`--gemini_dir=${account.dir}`]), { timeoutMs: 15_000, env: accountEnv(process.env, account.dir), signal })
               if (signal?.aborted) return { type: "failed", error: "Account registration was cancelled." }
               if (probe.err || probe.code !== 0 || !probe.stdout.trim()) return { type: "failed", error: "agy could not verify this saved account. Check its login before registering it." }
               forgetStoredSignIn({ dead: true })
