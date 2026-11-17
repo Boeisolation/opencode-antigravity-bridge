@@ -29,6 +29,7 @@ import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, storedEmail, store
 import { AGY_MANUAL, installAgy, keepAgyCurrent } from "./install.mjs"
 import { COMPACTION_INSTRUCTIONS, compactionPrompts, openCodeCompactionStart } from "./compaction.mjs"
 import { fetchCloudCodeModels, getCachedCloudCodeModels, invalidateModelMetadataCache, isReasoningModel, resolveModelMetadata } from "./model-metadata.mjs"
+import { processExists } from "./proc.mjs"
 
 const PACKAGE_METADATA = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"))
 export const MIN_AGY_VERSION = "1.4.12"
@@ -2868,9 +2869,7 @@ function withStateLock(file, fn) {
           if (Date.now() - fs.statSync(lock).mtimeMs > 5_000) {
             const owner = JSON.parse(fs.readFileSync(lock, "utf8"))
             if (Number.isSafeInteger(owner.pid) && owner.pid > 0) {
-              try { process.kill(owner.pid, 0) } catch (error) {
-                if (error.code === "ESRCH") fs.unlinkSync(lock)
-              }
+              if (!processExists(owner.pid)) fs.unlinkSync(lock)
             }
           }
         } catch {}

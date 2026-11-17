@@ -200,3 +200,17 @@ test("WSL quota and context unlock reject before touching host credentials or la
   assert.throws(() => wslPath("//server/share", "Ubuntu", "win32"), /UNC/)
   assert.throws(() => wslAgyPath({ ...env, AGY_PATH: "agy --foo; echo bad" }, "win32"), /one executable/)
 })
+
+test("proc.mjs treats Linux zombie and dead processes as non-existent even when kill(pid, 0) succeeds", async () => {
+  const { processExists, processStatus, processZombie } = await import("./proc.mjs")
+  const okKill = () => {}
+  assert.equal(processZombie(42, { readFile: () => "42 (node (v20)) Z 1 42 42 0 -1" }), true)
+  assert.equal(processZombie(42, { readFile: () => "42 (node) X 1 42 42 0 -1" }), true)
+  assert.equal(processZombie(42, { readFile: () => "42 (node) S 1 42 42 0 -1" }), false)
+  assert.equal(processExists(42, { platform: "linux", kill: okKill, readFile: () => "42 (agy) Z 1 42 42" }), false)
+  assert.equal(processStatus(42, { platform: "linux", kill: okKill, readFile: () => "42 (agy) Z 1 42 42" }).state, "dead")
+  assert.equal(processExists(42, { platform: "linux", kill: okKill, readFile: () => "42 (agy) S 1 42 42" }), true)
+  assert.equal(processExists(42, { platform: "darwin", kill: okKill, readFile: () => "42 (agy) Z 1 42 42" }), true)
+  assert.equal(processExists(42, { platform: "linux", kill: () => { throw Object.assign(new Error("nope"), { code: "ESRCH" }) } }), false)
+  assert.equal(processExists(42, { platform: "linux", kill: () => { throw Object.assign(new Error("perm"), { code: "EPERM" }) }, readFile: () => "42 (agy) S 1 42 42" }), true)
+})
