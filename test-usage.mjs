@@ -8,6 +8,7 @@ import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
 import { createUsageReader, fetchUsage, parseUsageReport } from "./usage.mjs"
+import { catalogRows, modelsInGroup, storeCatalogRows } from "./model-ids.mjs"
 import { agySpawnSpec } from "./platform.mjs"
 import { forgetStoredSignIn } from "./signin.mjs"
 
@@ -806,4 +807,94 @@ test("a timeout with only OAuth diagnostics preserves sign-in instead of marking
   f.env.TEST_MODE = ""
   assert.equal((await read()).windows.length, 1)
   await f.assertClean()
+})
+
+const LIVE_REPORT = {
+  status: "SUCCESS",
+  command: {
+    name: "usage",
+    data: {
+      groups: [
+        {
+          name: "Gemini Models",
+          description: "Models within this group: Gemini 4 Hydrogen, Gemini 3.8 Flash",
+          buckets: [
+            { id: "gemini-weekly", name: "Weekly Limit Remaining", window: "weekly", remaining_fraction: 1, reset_time: "2026-11-22T11:19:33Z" },
+            { id: "gemini-5h", name: "Five Hour Limit Remaining", window: "5h", remaining_fraction: 1, reset_time: "2026-11-15T16:19:33Z" },
+          ],
+        },
+        {
+          name: "Claude and GPT models",
+          description: "Models within this group: Claude Opus 5.5, Claude Sonnet 5.5, GPT-OSS 120B",
+          buckets: [
+            { id: "3p-weekly", name: "Weekly Limit Remaining", window: "weekly", remaining_fraction: 0.3360503911972046, reset_time: "2026-11-20T09:01:10Z" },
+            { id: "3p-5h", name: "Five Hour Limit Remaining", window: "5h", remaining_fraction: 1, reset_time: "2026-11-15T16:19:33Z" },
+          ],
+        },
+        {
+          name: "Gemini 4 Argon",
+          description: "For paid Pro plans, Argon quota is separate.",
+          buckets: [
+            { id: "gemini-argon-wtu-weekly", name: "Gemini 4 Argon Weekly Limit", window: "weekly", remaining_fraction: 1, reset_time: "2026-11-22T11:19:33Z" },
+          ],
+        },
+      ],
+    },
+  },
+}
+
+const LIVE_MODEL_ROWS = [
+  { id: "gemini-4-argon-medium", name: "Gemini 4 Argon (Medium)", effort: "medium" },
+  { id: "gemini-4-argon-high", name: "Gemini 4 Argon (High)", effort: "high" },
+  { id: "gemini-4-argon-low", name: "Gemini 4 Argon (Low)", effort: "low" },
+  { id: "gemini-4-hydrogen-high", name: "Gemini 4 Hydrogen (High)", effort: "high" },
+  { id: "gemini-4-hydrogen-xhigh", name: "Gemini 4 Hydrogen (XHigh)", effort: "xhigh" },
+  { id: "gemini-4-hydrogen-medium", name: "Gemini 4 Hydrogen (Medium)", effort: "medium" },
+  { id: "gemini-4-hydrogen-low", name: "Gemini 4 Hydrogen (Low)", effort: "low" },
+  { id: "gemini-pro-orchestrator-g1-pro", name: "Orchestrator (Argon)" },
+  { id: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)", effort: "high" },
+  { id: "gemini-3.8-flash-medium", name: "Gemini 3.8 Flash (Medium)", effort: "medium" },
+  { id: "gemini-3.8-flash-low", name: "Gemini 3.8 Flash (Low)", effort: "low" },
+  { id: "claude-opus-5-5-low", name: "Claude Opus 5.5 (Low)", effort: "low" },
+  { id: "claude-opus-5-5-medium", name: "Claude Opus 5.5 (Medium)", effort: "medium" },
+  { id: "claude-opus-5-5-high", name: "Claude Opus 5.5 (High)", effort: "high" },
+  { id: "claude-sonnet-5-5-low", name: "Claude Sonnet 5.5 (Low)", effort: "low" },
+  { id: "claude-sonnet-5-5-medium", name: "Claude Sonnet 5.5 (Medium)", effort: "medium" },
+  { id: "claude-sonnet-5-5-high", name: "Claude Sonnet 5.5 (High)", effort: "high" },
+  { id: "gpt-oss-120b-medium", name: "GPT-OSS 120B (Medium)", effort: "medium" },
+]
+
+test("parseUsageReport attaches catalog model ids per window without guessing unknown groups", t => {
+  t.after(() => storeCatalogRows(null))
+  storeCatalogRows(LIVE_MODEL_ROWS)
+  assert.equal(catalogRows()?.length, LIVE_MODEL_ROWS.length)
+  const result = parseUsageReport(structuredClone(LIVE_REPORT))
+  assert.deepEqual(result.windows.map(w => w.models), [
+    ["gemini-3.8-flash", "gemini-3.8-flash-high", "gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-4-hydrogen", "gemini-4-hydrogen-high", "gemini-4-hydrogen-low", "gemini-4-hydrogen-medium", "gemini-4-hydrogen-xhigh"],
+    ["gemini-3.8-flash", "gemini-3.8-flash-high", "gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-4-hydrogen", "gemini-4-hydrogen-high", "gemini-4-hydrogen-low", "gemini-4-hydrogen-medium", "gemini-4-hydrogen-xhigh"],
+    ["claude-opus-5-5", "claude-opus-5-5-high", "claude-opus-5-5-low", "claude-opus-5-5-medium", "claude-sonnet-5-5", "claude-sonnet-5-5-high", "claude-sonnet-5-5-low", "claude-sonnet-5-5-medium", "gpt-oss-120b", "gpt-oss-120b-medium"],
+    ["claude-opus-5-5", "claude-opus-5-5-high", "claude-opus-5-5-low", "claude-opus-5-5-medium", "claude-sonnet-5-5", "claude-sonnet-5-5-high", "claude-sonnet-5-5-low", "claude-sonnet-5-5-medium", "gpt-oss-120b", "gpt-oss-120b-medium"],
+    ["gemini-4-argon", "gemini-4-argon-high", "gemini-4-argon-low", "gemini-4-argon-medium"],
+  ])
+  assert.deepEqual(result.windows.map(w => w.used), [0, 0, 66.394961, 0, 0])
+  assert.ok(result.windows[2].models.includes("gpt-oss-120b"))
+  storeCatalogRows(null)
+  assert.equal(catalogRows(), null)
+})
+
+test("modelsInGroup matches catalog display names, handles missing commas, and ignores ambiguous families", t => {
+  t.after(() => storeCatalogRows(null))
+  storeCatalogRows(LIVE_MODEL_ROWS)
+  assert.deepEqual(modelsInGroup({ description: "Models within this group: Claude Opus 5.5", name: "x" }),
+    ["claude-opus-5-5", "claude-opus-5-5-high", "claude-opus-5-5-low", "claude-opus-5-5-medium"])
+  assert.deepEqual(modelsInGroup({ description: "Models within this group: Claude Opus 6", name: "x" }), [])
+  assert.deepEqual(modelsInGroup({ description: "Models within this group: Claude Opus 5.5 and Claude Opus 6", name: "x" }),
+    ["claude-opus-5-5", "claude-opus-5-5-high", "claude-opus-5-5-low", "claude-opus-5-5-medium"])
+  assert.deepEqual(modelsInGroup({ name: "Veo models" }), [])
+  storeCatalogRows(null)
+  assert.deepEqual(modelsInGroup({ description: "Models within this group: Claude Opus 5.5" }), [])
+  storeCatalogRows([{ id: "m1", name: "Model One" }, { id: "m2", name: "Model Two" }])
+  assert.deepEqual(modelsInGroup({ description: "Models within this group: Model One and Model Two" }), ["m1", "m2"])
+  storeCatalogRows([{ id: "a-high", name: "Twin (High)", effort: "high" }, { id: "b", name: "Twin" }, { id: "c", name: "Solo" }])
+  assert.deepEqual(modelsInGroup({ description: "Models within this group: Twin, Solo" }), ["c"])
 })
