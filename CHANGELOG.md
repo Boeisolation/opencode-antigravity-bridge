@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.10.0
+
+- Absorb `agy-cli` 0.1.65–0.1.89 (`4b3af4a5`) parity updates across the bridge and update `NOTICE.md` attribution.
+- Intercept `agy` `Individual quota reached` end-turn banners as retryable 429 rate limits and `Verification Required` notices as non-retryable 403 errors with `agy-acp.log` verification links (`agent-notice.mjs`, `usage.mjs`, `index.mjs`).
+- Compile the Windows `nc.exe` MCP shim (`platform.mjs`), enforce client tool loading (`502 tools_not_loaded`), and retire sessions whose tools failed to load (`tools_unlisted`).
+- Harden tool-turn and prompt handling (`index.mjs`): recover Codex dropped pending calls via `steerInSession`, immediately replay turns moved on to other providers, fold split Hermes batch calls, accept carried answered subsets, skip `thinking` blocks in `assistantTextOf`, preserve the newest history turn before oversized first-turn truncation, and emit structured `drop_live` reasons.
+- Add direct Code Assist quota fallback (`readQuotaDirect`) with in-memory token renewal, isolated `storedToken` reading (`signin.mjs`), account/license/verification refusal classification (`agyRefusal` wired into `models()`, `#setModel`, and `#formatAgentError`), and quota-group-to-model-ID mapping (`model-ids.mjs` `storeCatalogRows`).
+- Pass `--disable-telemetry`, `--include-default-customizations=false`, and `--settings '{"modelProvider":""}'` when supported; isolate conversations and `Proc` instances by `x-magpie-session` / `x-magpie-subagent` with `Request.text()` body fallback; add `documents.mjs` (URL/base64 text decoding and `tool_result` PDF degradation) and `proc.mjs` (Linux zombie lock detection); cloak DeepSeek Harness 0.2.2 Web GUI's browser sentence (`provides` -> `gives`) and update `DSH_HINT` (`cloak.mjs`).
+- Classify empty-catalog and unauthenticated `#setModel` failures as 503/401, raise model catalog probe timeout to 45s, auto-enable `systemPrompt.append` for oversized system prompts when supported, and recognize Claude Code compaction prompts in `compaction.mjs` for fragment staging.
+
 ## 0.9.1
 
 - Declare a 512,000-token context window to Magpie and OpenCode for the official agy CLI, bounded by smaller model limits. Require a selected, verified managed unlock for larger windows, up to the model's physical limit (maximum 1,048,576); model metadata and `AGY_BRIDGE_CONTEXT_WINDOW` can no longer bypass the official ceiling. Keep GPT-OSS capped at 131,072.
