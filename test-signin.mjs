@@ -14,6 +14,7 @@ import {
   readAccountSignIn,
   readStoredSignIn,
   storedEmail,
+  storedToken,
 } from "./signin.mjs"
 import { createUsageReader } from "./usage.mjs"
 
@@ -102,7 +103,7 @@ test("createUsageReader avoids spawning agy when expired/dead and latches dead c
   await fs.mkdir(path.join(workDir, "antigravity-cli"), { recursive: true })
   await fs.writeFile(
     path.join(workDir, "antigravity-cli", "antigravity-oauth-token"),
-    JSON.stringify({ token: { access_token: "a", refresh_token: "r", expiry: new Date(Date.now() + 60_000).toISOString() } }),
+    JSON.stringify({ token: { access_token: "a", refresh_token: "r", expiry: new Date(Date.now() + 10 * 60_000).toISOString() } }),
   )
   const stored = await readAccountSignIn(workDir, { env })
   assert.equal(stored.state, "present")
@@ -164,4 +165,41 @@ test("stored keyring reads honor AGY_BRIDGE_DISABLE_KEYCHAIN and never touch Win
   assert.deepEqual(await readStoredSignIn({ platform: "darwin", exec, env: { AGY_BRIDGE_DISABLE_KEYCHAIN: "1" } }), { state: "unknown" })
   assert.deepEqual(await readStoredSignIn({ platform: "win32", exec, env: { AGY_BRIDGE_WSL_DISTRO: "Ubuntu" } }), { state: "unknown" })
   assert.equal(spawned, 0)
+})
+
+test("storedToken reads default and named-account tokens while honoring skip, keychain, and WSL isolation", async t => {
+  const payload = { token: { access_token: "ya29.test", refresh_token: "1//r", expiry: "2026-11-20T00:00:00Z" }, auth_method: "consumer" }
+  const raw = JSON.stringify(payload)
+  const b64 = `go-keyring-base64:${Buffer.from(raw).toString("base64")}`
+
+  assert.deepEqual(await storedToken({
+    platform: "darwin",
+    env: {},
+    exec: async () => ({ code: 0, stdout: b64 + "\n" }),
+  }), payload)
+  assert.deepEqual(await storedToken({
+    platform: "win32",
+    env: {},
+    exec: async () => ({ code: 0, stdout: `OK ${Buffer.from(raw).toString("base64")}\r\n` }),
+  }), payload)
+  assert.equal(await storedToken({
+    platform: "darwin",
+    env: {},
+    exec: async () => ({ code: 0, stdout: JSON.stringify({ api_key: "k" }) }),
+  }), null)
+  assert.equal(await storedToken({
+    platform: "darwin",
+    env: { AGY_BRIDGE_DISABLE_KEYCHAIN: "1" },
+    exec: async () => { throw new Error("should not call security") },
+  }), null)
+
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-stored-token-"))
+  t.after(() => fs.rm(dir, { recursive: true, force: true }))
+  assert.equal(await storedToken({ geminiDir: dir, env: {} }), null)
+  await fs.mkdir(path.join(dir, "antigravity-cli"), { recursive: true })
+  await fs.writeFile(path.join(dir, "antigravity-cli", "antigravity-oauth-token"), raw)
+  assert.deepEqual(await storedToken({ geminiDir: dir, env: {} }), payload)
+  assert.deepEqual(await storedToken({ dir, env: {} }), payload)
+  assert.equal(await storedToken({ geminiDir: dir, env: { AGY_BRIDGE_STORED_SIGNIN: "skip" } }), null)
+  assert.equal(await storedToken({ geminiDir: dir, platform: "win32", env: { AGY_BRIDGE_WSL_DISTRO: "Ubuntu" } }), null)
 })
