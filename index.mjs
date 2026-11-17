@@ -78,7 +78,13 @@ function detachedEvictMs() {
 const MAX_PARKED = 32
 const MAX_PROMPT_ATTEMPTS = 128
 const DEFAULT_PROC_START_TIMEOUT_MS = 60_000
-const systemAppend = () => /^(?:1|true|on|yes)$/i.test(process.env.AGY_BRIDGE_SYSTEM_APPEND || "")
+const AUTO_SYSTEM_APPEND_BYTES = 60_000
+function systemAppend(instructions = "") {
+  const raw = (process.env.AGY_BRIDGE_SYSTEM_APPEND || "").trim()
+  if (/^(?:0|false|off|no|disabled?)$/i.test(raw)) return false
+  if (/^(?:1|true|on|yes|enabled?)$/i.test(raw)) return true
+  return !!instructions && Buffer.byteLength(outgoingSystemText(instructions), "utf8") > AUTO_SYSTEM_APPEND_BYTES
+}
 const promptGuardEnabled = () => process.env.AGY_BRIDGE_PROMPT_GUARD !== "0"
 // Bound silence without meaningful agy output. agy emits nothing while it
 // generates tool-call arguments, so a large Write can be silent for minutes;
@@ -1725,7 +1731,7 @@ class Proc {
     const capabilities = init?.agentCapabilities ?? {}
     this.supportsImages = capabilities.promptCapabilities?.image === true ||
       capabilities.prompt_capabilities?.image === true
-    const appendable = systemAppend() && capabilities._meta?.antigravity?.systemPrompt?.append === true
+    const appendable = systemAppend(this.instructions) && capabilities._meta?.antigravity?.systemPrompt?.append === true
     const resumable = !!(capabilities.sessionCapabilities?.resume ?? capabilities.session_capabilities?.resume)
     this.instructionsInSession = appendable && !!this.instructions
     const meta = this.instructionsInSession
@@ -3183,7 +3189,7 @@ function park(proc) {
     historyHashSansInputs: digest(historyKey(stripToolUseInputs(proc.expectedMessages))),
     toolUseIdentitiesHash: digest(toolUseIdentitiesKey(proc.expectedMessages) ?? ""),
     instructionsHash: digest(instructionsIdentity(proc.instructions)),
-    systemAppend: systemAppend(),
+    systemAppend: systemAppend(proc.instructions),
     workDir: proc.workDir,
     userCloak: USER_CLOAK,
     at: Date.now(),
@@ -3197,7 +3203,7 @@ function peekParked(convKey, opts) {
   const entry = parked.get(convKey)
   if (!entry || Date.now() - entry.at > RESUME_TTL_MS || (entry.workDir ?? null) !== (opts.workDir ?? null) ||
     entry.instructionsHash !== digest(instructionsIdentity(opts.instructions)) ||
-    entry.systemAppend !== systemAppend() ||
+    entry.systemAppend !== systemAppend(opts.instructions) ||
     entry.userCloak !== USER_CLOAK) return null
   if (entry.historyHash === digest(historyKey(opts.history))) return entry
   const ids = toolUseIdentitiesKey(opts.history)
@@ -6652,9 +6658,10 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                 }
               }
               if (isEphemeralSidePrompt(trailing, resultBlocks)) {
+                const useSystemAppend = systemAppend(instructions)
                 validateAcpPromptBudget(
-                  renderReplayPromptParts(body, callerWorkDir, systemAppend() && !!instructions, instructions),
-                  systemAppend() ? instructions : "", body,
+                  renderReplayPromptParts(body, callerWorkDir, useSystemAppend && !!instructions, instructions),
+                  useSystemAppend ? instructions : "", body,
                 )
                 const key = `${convKey}:ephemeral:${randomUUID()}`
                 promptAttempt = claimPromptAttempt(promptAttemptKey(key, body, trailing, model, selection, [], instructions))
@@ -6690,9 +6697,12 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                 messages: body.messages, layout, nonstream: body.stream === false,
                 account: account.name, accountKey: account.key, geminiDir: account.dir,
                 userId: body.metadata?.user_id || "", sessionScope,
-                validateReplay: () => validateAcpPromptBudget(
-                  renderReplayPromptParts(body, callerWorkDir, systemAppend() && !!instructions, instructions),
-                  systemAppend() ? instructions : "", body) }
+                validateReplay: () => {
+                  const useSystemAppend = systemAppend(instructions)
+                  return validateAcpPromptBudget(
+                    renderReplayPromptParts(body, callerWorkDir, useSystemAppend && !!instructions, instructions),
+                    useSystemAppend ? instructions : "", body)
+                } }
               const claim = (continuationOpts = null) => {
                 if (!promptAttempt) {
                   const key = promptAttemptKey(convKey, body, trailing, model, selection, tools, instructions)

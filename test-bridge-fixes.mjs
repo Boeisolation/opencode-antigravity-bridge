@@ -1799,3 +1799,147 @@ if (args.includes("models")) {
     }
   }
 })
+
+
+test("oversized system prompts auto-offload to _meta.antigravity.systemPrompt.append while small prompts stay inline", async () => {
+  const caseRoot = path.join(root, "auto-system-append-13b")
+  const accountsDir = path.join(caseRoot, "accounts")
+  const convDir = path.join(caseRoot, "convs")
+  const stateFile = path.join(caseRoot, "state.json")
+  const logFile = path.join(caseRoot, "events.jsonl")
+  fs.mkdirSync(convDir, { recursive: true })
+  fs.writeFileSync(logFile, "")
+
+  const fakeDir = path.join(caseRoot, "bin")
+  const fakeBin = writeFakeAgy(fakeDir, `
+import fs from "node:fs";
+import readline from "node:readline";
+const args = process.argv.slice(2);
+if (args.includes("--help")) process.exit(0);
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
+const logPath = ${JSON.stringify(logFile)};
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+let count = 0;
+readline.createInterface({ input: process.stdin }).on("line", line => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {
+        protocolVersion: 1,
+        agentCapabilities: {
+          promptCapabilities: { image: true },
+          _meta: { antigravity: { systemPrompt: { append: true } } },
+        },
+        agentInfo: { name: "fake-agy", version: "1.5.9" },
+      },
+    });
+  } else if (msg.method === "session/new") {
+    const sid = "s-app-" + (++count);
+    fs.appendFileSync(logPath, JSON.stringify({
+      type: "new",
+      sid,
+      append: msg.params?._meta?.antigravity?.systemPrompt?.append ?? null,
+    }) + "\\n");
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: sid } });
+  } else if (msg.method === "session/set_model" || msg.method === "session/set_config_option") {
+    send({ jsonrpc: "2.0", id: msg.id, result: {} });
+  } else if (msg.method === "session/prompt") {
+    const sid = msg.params?.sessionId;
+    const text = (msg.params?.prompt || []).map(p => p.text || "").join("\\n");
+    fs.appendFileSync(logPath, JSON.stringify({
+      type: "prompt",
+      sid,
+      bytes: Buffer.byteLength(text, "utf8"),
+      hasInlineSystem: text.includes("<external_system_instructions>"),
+    }) + "\\n");
+    send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok:" + sid } } } });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  }
+});
+`)
+
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+    AGY_BRIDGE_SYSTEM_APPEND: process.env.AGY_BRIDGE_SYSTEM_APPEND,
+    AGY_BRIDGE_UNLOCKED: process.env.AGY_BRIDGE_UNLOCKED,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = convDir
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  delete process.env.AGY_BRIDGE_SYSTEM_APPEND
+  delete process.env.AGY_BRIDGE_UNLOCKED
+
+  try {
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-13b=${Date.now()}`)
+    const plugin = await AntigravityBridgePlugin()
+    const loader = await plugin.auth.loader()
+
+    // 1. Small system prompt stays inline when AGY_BRIDGE_SYSTEM_APPEND is unset.
+    const rSmall = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        system: "You are concise.",
+        metadata: { user_id: "u-small-sys" },
+        messages: [{ role: "user", content: "hello small" }],
+      }),
+    })
+    const bSmall = await rSmall.json()
+    assert.equal(rSmall.status, 200, JSON.stringify(bSmall))
+
+    // 2. Oversized 190 KB system prompt auto-offloads into _meta.antigravity.systemPrompt.append, bypassing the 180 KB user limit.
+    const largeSystem = "LARGE_SYS_MARKER_" + "S".repeat(190_000)
+    const rLarge = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        system: largeSystem,
+        metadata: { user_id: "u-large-sys" },
+        messages: [{ role: "user", content: "hello large" }],
+      }),
+    })
+    const bLarge = await rLarge.json()
+    assert.equal(rLarge.status, 200, JSON.stringify(bLarge))
+
+    const events = fs.readFileSync(logFile, "utf8").trim().split("\n").filter(Boolean).map(l => JSON.parse(l))
+    const newEvents = events.filter(e => e.type === "new")
+    const promptEvents = events.filter(e => e.type === "prompt")
+    assert.equal(newEvents[0]?.append, null)
+    assert.equal(promptEvents[0]?.hasInlineSystem, true)
+    assert.ok(typeof newEvents[1]?.append === "string" && newEvents[1].append.includes("LARGE_SYS_MARKER_"))
+    assert.equal(Buffer.byteLength(newEvents[1].append, "utf8") > 190_000, true)
+    assert.equal(promptEvents[1]?.hasInlineSystem, false)
+    assert.ok(promptEvents[1]?.bytes < 1000)
+
+    // 3. Explicit AGY_BRIDGE_SYSTEM_APPEND=0 disables auto-offload and rejects the 190 KB inline prompt cleanly with 400.
+    process.env.AGY_BRIDGE_SYSTEM_APPEND = "0"
+    const rDisabled = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        system: largeSystem,
+        metadata: { user_id: "u-large-disabled" },
+        messages: [{ role: "user", content: "hello disabled" }],
+      }),
+    })
+    const bDisabled = await rDisabled.json()
+    assert.equal(rDisabled.status, 400, JSON.stringify(bDisabled))
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
