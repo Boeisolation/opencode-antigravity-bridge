@@ -1559,6 +1559,7 @@ class Proc {
     this.agyPath = agyPath
     this.convKey = convKey
     this.userId = opts.userId || ""
+    this.sessionScope = opts.sessionScope || ""
     this.openingText = openingTextOf(opts.messages?.[0])
     this.openingImages = openingImagesOf(opts.messages?.[0])
     this.account = opts.account || null
@@ -3342,7 +3343,7 @@ async function withAcquireLock(key, fn) {
 
 function findFlattenedProc(opts) {
   const candidates = [...pool.values()].filter(proc => !proc.dead && !proc.retiring && !proc.turn && !proc.steering && !proc.continuingCancel && !proc.compaction && !proc.ephemeral && proc.hasSentFirstTurn &&
-    (proc.account || null) === (opts.account || null) && proc.agyPath === findAgy() && proc.userId === (opts.userId || "") &&
+    (proc.account || null) === (opts.account || null) && sameSessionScope(proc, opts.sessionScope) && proc.agyPath === findAgy() && proc.userId === (opts.userId || "") &&
     proc.workDir === opts.workDir && proc.model === opts.model && proc.toolsSignature === JSON.stringify(opts.tools) &&
     sameInstructions(proc.instructions, opts.instructions) && isContinuedOpening(proc, opts.messages?.[0]))
   candidates.sort((a, b) => b.openingText.length - a.openingText.length)
@@ -4263,10 +4264,13 @@ function lastAssistantCalls(messages) {
     ? message.content.filter(block => block.type === "tool_use") : [])
 }
 
-function matchToolResults(body, blocks, accountName = null) {
-  // A tool result only ever belongs to the account that issued the call; a
-  // continuation addressed to another account must not match it.
-  const own = (match) => match && (match.proc.account ?? null) === (accountName ?? null) ? match : undefined
+function sameSessionScope(proc, sessionScope = "") {
+  return (proc?.sessionScope || "") === (sessionScope || "")
+}
+
+function matchToolResults(body, blocks, accountName = null, sessionScope = "") {
+  // A tool result only ever belongs to the account and session scope that issued the call.
+  const own = (match) => match && (match.proc.account ?? null) === (accountName ?? null) && sameSessionScope(match.proc, sessionScope) ? match : undefined
   const direct = blocks.map(block => ({ block, match: own(toolCalls.get(block.tool_use_id)) }))
   if (direct.every(item => item.match)) return direct
   const { history } = trailingMessages(body)
@@ -4276,7 +4280,7 @@ function matchToolResults(body, blocks, accountName = null) {
     blocks.some(block => !byID.has(block.tool_use_id))) return direct
   let found = null
   for (const proc of allProcs) {
-    if ((proc.account ?? null) !== (accountName ?? null)) continue
+    if ((proc.account ?? null) !== (accountName ?? null) || !sameSessionScope(proc, sessionScope)) continue
     if (!proc.turn || proc.turn.finalized || !proc.matchesHistory(history)) continue
     const shown = lastAssistantCalls(proc.expectedMessages)
     if (shown.length !== calls.length || shown.some((call, index) =>
@@ -4344,13 +4348,24 @@ function sameInstructions(a, b) {
   return instructionsIdentity(a) === instructionsIdentity(b)
 }
 
+function requestSessionScope(fetchInput, init) {
+  const headers = new Headers(
+    init?.headers ?? (fetchInput instanceof Request ? fetchInput.headers : undefined) ?? {},
+  )
+  const rawSession = headers.get("x-magpie-session")?.trim() || ""
+  const session = /^magpie-[0-9a-f]{24}$/.test(rawSession) ? "" : rawSession.slice(0, 128)
+  const subagent = (headers.get("x-magpie-subagent")?.trim() || "").slice(0, 64)
+  return session || subagent ? `${session}\n${subagent}` : ""
+}
+
 // The model is not part of the key: agy switches models inside a live session.
-function conversationKey(rawBody) {
+function conversationKey(rawBody, sessionScope = "") {
   const body = canonicalBody(rawBody)
   const system = historyKey([{ role: "system", content: instructionsIdentity(systemText(body)) }])
   const first = body.messages?.[0]
   const firstText = first ? historyKey([first]) : ""
-  const discriminator = body.metadata?.user_id || ""
+  const userId = body.metadata?.user_id || ""
+  const discriminator = sessionScope ? `${userId}\n${sessionScope}` : userId
   const source = discriminator + "\n" + system + "\n===\n" + firstText
   return createHash("sha256").update(source).digest("hex")
 }
@@ -6354,7 +6369,9 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
             if (!agy) return jsonError(503, cachedAgyError || "agy CLI not found on this machine")
             let body
             try {
-              const raw = typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body)
+              const raw = init.body != null
+                ? (typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body))
+                : (typeof fetchInput?.text === "function" ? await fetchInput.text() : "")
               body = JSON.parse(raw)
               validateBody(body)
             } catch (error) {
@@ -6402,8 +6419,10 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
               return jsonError(error.statusCode ?? 502, error.message, error.code, error.noRetry)
             }
             const selection = { model: requestedModel, effort: requestedEffort(body) }
-            // Accounts never share conversations, pooled processes or dedup state.
-            const convKey = account.name ? `account:${account.name}::${conversationKey(body)}` : conversationKey(body)
+            const sessionScope = requestSessionScope(fetchInput, init)
+            // Accounts and session/subagent scopes never share conversations, pooled processes or dedup state.
+            const baseConvKey = conversationKey(body, sessionScope)
+            const convKey = account.name ? `account:${account.name}::${baseConvKey}` : baseConvKey
             const trailing = trailingMessages(body)
             const isFresh = trailing.history.length === 0
             const resultBlocks = extractToolResults(body)
@@ -6486,14 +6505,15 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                   if (block?.type !== "tool_use") continue
                   const entry = toolCalls.get(block.id)
                   if (!entry || entry.call.clientSeen) continue
-                  if ((entry.proc.account ?? null) !== (account.name ?? null)) continue
+                  if ((entry.proc.account ?? null) !== (account.name ?? null) || !sameSessionScope(entry.proc, sessionScope)) continue
                   entry.call.clientSeen = true
                   entry.turn.touchClient()
                 }
               }
               const acquireOpts = { model, selection, tools, workDir, instructions, history: trailing.history,
                 messages: body.messages, layout, nonstream: body.stream === false,
-                account: account.name, accountKey: account.key, geminiDir: account.dir, userId: body.metadata?.user_id || "",
+                account: account.name, accountKey: account.key, geminiDir: account.dir,
+                userId: body.metadata?.user_id || "", sessionScope,
                 validateReplay: () => validateAcpPromptBudget(
                   renderReplayPromptParts(body, callerWorkDir, systemAppend() && !!instructions, instructions),
                   systemAppend() ? instructions : "", body) }
@@ -6520,7 +6540,7 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                 return beginTurn(proc, history, body, callerWorkDir, model, selection, promptAttempt, promptGuardMatched, acquireOpts.cancelContinuation)
               }
               if (resultBlocks.length) {
-                const matches = matchToolResults(body, resultBlocks, account.name)
+                const matches = matchToolResults(body, resultBlocks, account.name, sessionScope)
                 const found = matches.filter((item) => item.match)
                 if (found.length) {
                   if (found.length !== matches.length) {

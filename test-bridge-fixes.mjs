@@ -1275,3 +1275,111 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     }
   }
 })
+
+
+test("x-magpie-session/subagent headers isolate sessions and Request.text() body fallback works when init.body is omitted", async () => {
+  const convDir = path.join(root, "conv-scope")
+  const accountsDir = path.join(root, "accounts-scope")
+  const stateFile = path.join(root, "state-scope.json")
+  const fakeDir = path.join(root, "fake-scope-agy")
+  fs.mkdirSync(convDir, { recursive: true })
+  fs.mkdirSync(accountsDir, { recursive: true })
+  const fakeBin = writeFakeAgy(fakeDir, `
+import readline from "node:readline";
+const args = process.argv.slice(2);
+if (args.includes("--help")) process.exit(0);
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
+let count = 0;
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+readline.createInterface({ input: process.stdin }).on("line", line => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } }, agentInfo: { name: "fake-agy", version: "1.5.9" } } });
+  else if (msg.method === "session/new") send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-scope-" + (++count) + "-" + process.pid } });
+  else if (msg.method === "session/set_model" || msg.method === "session/set_config_option") send({ jsonrpc: "2.0", id: msg.id, result: {} });
+  else if (msg.method === "session/prompt") {
+    const sid = msg.params?.sessionId;
+    send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "sid:" + sid } } } });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  }
+});
+`)
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = convDir
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  try {
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-scope=${Date.now()}`)
+    const plugin = await AntigravityBridgePlugin()
+    const loader = await plugin.auth.loader()
+    const payload = { model: "gemini-test", stream: false, messages: [{ role: "user", content: "same opening" }] }
+    const rA = await loader.fetch(new Request("http://local/messages", {
+      method: "POST",
+      headers: { "x-magpie-session": "sess-alpha" },
+      body: JSON.stringify(payload),
+    }))
+    const bA = await rA.json()
+    assert.equal(rA.status, 200, JSON.stringify(bA))
+    const rB = await loader.fetch(new Request("http://local/messages", {
+      method: "POST",
+      headers: { "x-magpie-session": "sess-beta", "x-magpie-subagent": "reviewer" },
+      body: JSON.stringify(payload),
+    }))
+    const bB = await rB.json()
+    assert.equal(rB.status, 200, JSON.stringify(bB))
+    assert.notEqual(bA.content?.[0]?.text, bB.content?.[0]?.text)
+    const rA2 = await loader.fetch(new Request("http://local/messages", {
+      method: "POST",
+      headers: { "x-magpie-session": "sess-alpha" },
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        messages: [
+          { role: "user", content: "same opening" },
+          { role: "assistant", content: bA.content },
+          { role: "user", content: "alpha follow up" },
+        ],
+      }),
+    }))
+    const bA2 = await rA2.json()
+    assert.equal(rA2.status, 200, JSON.stringify(bA2))
+    assert.equal(bA2.content?.[0]?.text, bA.content?.[0]?.text)
+
+    // Ephemeral magpie-<24hex> session IDs are ignored so they still reuse the same un-scoped session.
+    const rM1 = await loader.fetch(new Request("http://local/messages", {
+      method: "POST",
+      headers: { "x-magpie-session": "magpie-0123456789abcdef01234567" },
+      body: JSON.stringify({ model: "gemini-test", stream: false, messages: [{ role: "user", content: "ephemeral id test" }] }),
+    }))
+    const bM1 = await rM1.json()
+    const rM2 = await loader.fetch(new Request("http://local/messages", {
+      method: "POST",
+      headers: { "x-magpie-session": "magpie-fedcba9876543210fedcba98" },
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        messages: [
+          { role: "user", content: "ephemeral id test" },
+          { role: "assistant", content: bM1.content },
+          { role: "user", content: "follow up" },
+        ],
+      }),
+    }))
+    const bM2 = await rM2.json()
+    assert.equal(rM2.status, 200, JSON.stringify(bM2))
+    assert.equal(bM1.content?.[0]?.text, bM2.content?.[0]?.text)
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
