@@ -20,7 +20,7 @@ import { sanitizeSystemPrompt } from "./prompt-guard.mjs"
 import { classifyUpstreamError } from "./upstream-error.mjs"
 import { latestGenerationIdx, latestModelStep, modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
 import { OutputLimitFilter } from "./output-limit.mjs"
-import { AgentNoticeFilter, isRefused429 } from "./agent-notice.mjs"
+import { AgentNoticeFilter, isRefused429, VERIFY_LINE } from "./agent-notice.mjs"
 import { SummaryThoughtFilter } from "./thought-filter.mjs"
 import { sanitizeInputSchema, TOOL_SEARCH_INPUT_SCHEMA } from "./tool-schema.mjs"
 import { cloakUser, outgoing, hint, turnsAway } from "./cloak.mjs"
@@ -784,6 +784,43 @@ class AgentTurnError extends Error {
       this.noRetry = !classification.retryable
     }
   }
+}
+
+const VERIFY_REFUSAL_RE = /please verify your account in your browser to continue|verification required\. please complete verification|verify your account to continue/i
+const VERIFY_ADVICE = "this Google account needs to be verified"
+
+// Local fallback until WP2's usage.mjs exports (verifyLinkIn, verifyRefused) are wired in.
+function verifyLinkIn(output) {
+  const said = String(output ?? "").replace(/\\u0026/g, "&").replace(/&amp;/g, "&")
+  const named = (key) => new RegExp(`"?${key}"?\\s*[:=]\\s*"?(https://[^\\s"'\\\\<>]+)`, "i").exec(said)?.[1]
+  const link = named("validation_?link") || named("validation_?url") ||
+    /in your browser to continue:\s*(https:\/\/[^\s"'\\<>]+)/i.exec(said)?.[1] ||
+    /(https:\/\/accounts\.google\.com\/[^\s"'\\<>]+)/i.exec(said)?.[1] || ""
+  const trimmed = link.replace(/[).,;\]}]+$/, "")
+  try {
+    const u = new URL(trimmed)
+    return u.protocol === "https:" && u.host ? trimmed : ""
+  } catch {
+    return ""
+  }
+}
+
+function verifyRefused(link) {
+  const said = "Google wants this account verified before Antigravity serves it again (agy: \"Verification Required\")"
+  return link
+    ? `${said} — ${VERIFY_ADVICE}: open ${link} in a browser signed in to it, verify it, then try again`
+    : `${said} — ${VERIFY_ADVICE}: open the Antigravity app, or run \`agy\` in a terminal, signed in to it and do what it asks, then try again`
+}
+
+function refusedError(why) {
+  const error = new AgentTurnError(`agy bridge: ${why}`, "permission_error", {
+    category: "forbidden",
+    retryable: false,
+    reasonCode: "AGY_ERROR_FORBIDDEN",
+    retryAfterMs: null,
+  })
+  error.statusCode = 403
+  return error
 }
 
 function shellQuote(value) {
@@ -1976,12 +2013,12 @@ class Proc {
           const detail = turn.notices.terminalDetail || loggedDetail || turn.notices.apiDetail
           if (detail || result?.stopReason === "refusal") {
             turn.agentError = true
-            throw this.#formatAgentError(detail, turn.promptGuardMatched)
+            throw await this.#agentError(turn, detail)
           }
         }
         if (result?.stopReason === "refusal") {
           const detail = await lastAgentError(this.logPath, turn.logOffset)
-          if (detail) throw this.#formatAgentError(detail, turn.promptGuardMatched)
+          if (detail) throw await this.#agentError(turn, detail)
           if (this.compaction) throw new AgentTurnError("agy bridge: upstream refused the compaction request; no summary was produced")
         }
         // A dropped retry-only notice is not an answer. An uncorroborated
@@ -1995,7 +2032,7 @@ class Proc {
             const detail = turn.notices.terminalDetail || loggedDetail || turn.notices.apiDetail
             if (detail) {
               turn.agentError = true
-              throw this.#formatAgentError(detail, turn.promptGuardMatched)
+              throw await this.#agentError(turn, detail)
             }
             if (this.compaction) {
               throw new AgentTurnError("agy bridge: upstream returned an empty compaction response; no summary was produced")
@@ -2122,8 +2159,12 @@ class Proc {
     return turn.lastPromptResult
   }
 
-  async #agentError(turn) {
-    const detail = await lastAgentError(this.logPath, turn.logOffset)
+  async #agentError(turn, fallbackDetail = "") {
+    if (turn.notices.terminalDetail === VERIFY_LINE) {
+      const logged = await logTail(this.logPath, turn.logOffset)
+      return refusedError(verifyRefused(verifyLinkIn(`${turn.notices.apiDetail || ""}\n${logged}`)))
+    }
+    const detail = fallbackDetail || await lastAgentError(this.logPath, turn.logOffset)
     return this.#formatAgentError(detail, turn.promptGuardMatched)
   }
 
@@ -2133,6 +2174,9 @@ class Proc {
     }
     if (isRefused429(detail) && turnsAway(this.instructions) && (!promptGuardEnabled() || turnsAway(outgoingSystemText(this.instructions)))) {
       return new AgentTurnError(`agy bridge: Antigravity answered 429 to this system prompt — ${hint(this.instructions)}`, "rate_limit_error")
+    }
+    if (VERIFY_REFUSAL_RE.test(detail)) {
+      return refusedError(verifyRefused(verifyLinkIn(detail)))
     }
     const classification = classifyUpstreamError(detail, { promptGuardMatched })
     const kind = classification.category === "forbidden" ? "permission_error"
@@ -2776,9 +2820,7 @@ function lastAgentErrorSync(file, offset) {
   } catch { return false } finally { if (fd !== undefined) fs.closeSync(fd) }
 }
 
-// agy writes the real upstream error only to its log; read what this turn added.
-async function lastAgentError(file, offset) {
-  let text = ""
+async function logTail(file, offset) {
   try {
     const handle = await fs.promises.open(file, "r")
     try {
@@ -2786,14 +2828,18 @@ async function lastAgentError(file, offset) {
       const start = Math.max(offset || 0, size - LOG_TAIL_BYTES)
       const buffer = Buffer.alloc(Math.max(0, size - start))
       await handle.read(buffer, 0, buffer.length, start)
-      text = buffer.toString("utf8")
+      return buffer.toString("utf8")
     } finally {
       await handle.close()
     }
   } catch {
     return ""
   }
-  return extractAgentError(text)
+}
+
+// agy writes the real upstream error only to its log; read what this turn added.
+async function lastAgentError(file, offset) {
+  return extractAgentError(await logTail(file, offset))
 }
 
 function extractAgentError(text) {

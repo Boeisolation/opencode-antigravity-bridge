@@ -249,3 +249,27 @@ test("disabled account ToS notice and gRPC status banners are suppressed and rec
     }
   }
 })
+
+
+test("Verification Required and Individual quota reached banners are captured as terminal without breaking quoted text", () => {
+  const verify = "⚠ Verification Required"
+  const quota = "⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h18m40s."
+  for (const notice of [verify, quota]) {
+    for (const suffix of ["", "\n", "\r\n"]) {
+      for (const chunks of [[`\n${notice}${suffix}`], split(`\n${notice}${suffix}`)]) {
+        const f = new AgentNoticeFilter()
+        let output = ""
+        for (const c of chunks) output += f.push(c)
+        output += f.flush({ holdTerminal: true })
+        assert.equal(output.trim(), "")
+        assert.equal(f.failureCandidate, true)
+        assert.equal(f.terminalDetail, notice)
+      }
+    }
+    assert.equal(run([`Quoted: ${notice}\n`]).text, `Quoted: ${notice}\n`)
+    assert.equal(run([`\`\`\`\n${notice}\n\`\`\`\n`]).text, `\`\`\`\n${notice}\n\`\`\`\n`)
+    const recovered = run([`\n${notice}\n`, "Recovered."])
+    assert.equal(recovered.failureCandidate, false)
+    assert.equal(recovered.text, "Recovered.")
+  }
+})

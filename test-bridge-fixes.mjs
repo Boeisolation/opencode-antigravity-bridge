@@ -959,3 +959,102 @@ test("documents.mjs handles http(s) URLs, base64 UTF-8 text/JSON/XML, tool_resul
   assert.match(documentRefusal({ type: "document", source: { type: "file", file_id: "f_1" } }).what, /Files API file_id/)
   assert.match(documentRefusal({ type: "document", source: { type: "url", url: "ftp://x/y" } }).what, /other than http\(s\)/)
 })
+
+
+test("Individual quota reached maps to 429 with reset time and Verification Required extracts log link into 403 permission_error", async () => {
+  const convDir = path.join(root, "conv-qv")
+  const accountsDir = path.join(root, "accounts-qv")
+  const stateFile = path.join(root, "state-qv.json")
+  const fakeDir = path.join(root, "fake-qv-agy")
+  fs.mkdirSync(convDir, { recursive: true })
+  fs.mkdirSync(accountsDir, { recursive: true })
+  let count = 0
+  const fakeBin = writeFakeAgy(fakeDir, `
+import fs from "node:fs";
+import readline from "node:readline";
+const args = process.argv.slice(2);
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
+const logIdx = args.indexOf("--log-file");
+const agyLog = logIdx >= 0 ? args[logIdx + 1] : null;
+let count = 0;
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+readline.createInterface({ input: process.stdin }).on("line", line => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } }, agentInfo: { name: "fake-agy", version: "1.5.9" } } });
+  } else if (msg.method === "session/new") {
+    count++;
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-qv-" + count } });
+  } else if (msg.method === "session/set_model" || msg.method === "session/set_config_option") {
+    send({ jsonrpc: "2.0", id: msg.id, result: {} });
+  } else if (msg.method === "session/prompt") {
+    const sid = msg.params?.sessionId;
+    const text = (msg.params?.prompt || []).map(p => p.text || "").join("\\n");
+    let reply = "ok";
+    if (text.includes("TRIGGER_QUOTA")) {
+      reply = "\\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h18m40s.\\n";
+    } else if (text.includes("TRIGGER_VERIFY")) {
+      if (agyLog) fs.appendFileSync(agyLog, '2026/11/17 12:00:00 ERROR validation_url="https://accounts.google.com/signin/continue?s=abc\\u0026t=1"\\n');
+      reply = "\\n⚠ Verification Required\\n";
+    } else if (text.includes("QUOTE_BOTH")) {
+      reply = "Saw ⚠ Verification Required and ⚠ Individual quota reached in log.";
+    }
+    send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: reply } } } });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  }
+});
+`)
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = convDir
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  try {
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-qv=${Date.now()}`)
+    const plugin = await AntigravityBridgePlugin()
+    const loader = await plugin.auth.loader()
+
+    const quotaRes = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: `u-qv-${++count}` }, messages: [{ role: "user", content: "TRIGGER_QUOTA" }] }),
+    })
+    const quotaBody = await quotaRes.json()
+    assert.equal(quotaRes.status, 429, JSON.stringify(quotaBody))
+    assert.equal(quotaBody.error?.type, "rate_limit_error")
+    assert.equal(quotaBody.error?.code, "AGY_ERROR_QUOTA_EXHAUSTED")
+    assert.match(quotaBody.error?.message || "", /Resets in 1h18m40s/)
+
+    const verifyRes = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: `u-qv-${++count}` }, messages: [{ role: "user", content: "TRIGGER_VERIFY" }] }),
+    })
+    const verifyBody = await verifyRes.json()
+    assert.equal(verifyRes.status, 403, JSON.stringify(verifyBody))
+    assert.equal(verifyRes.headers.get("x-should-retry"), "false")
+    assert.equal(verifyBody.error?.type, "permission_error")
+    assert.equal(verifyBody.error?.code, "AGY_ERROR_FORBIDDEN")
+    assert.match(verifyBody.error?.message || "", /this Google account needs to be verified/)
+    assert.match(verifyBody.error?.message || "", /https:\/\/accounts\.google\.com\/signin\/continue\?s=abc&t=1/)
+
+    const quotedRes = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: `u-qv-${++count}` }, messages: [{ role: "user", content: "QUOTE_BOTH" }] }),
+    })
+    const quotedBody = await quotedRes.json()
+    assert.equal(quotedRes.status, 200, JSON.stringify(quotedBody))
+    assert.match(quotedBody.content?.[0]?.text || "", /⚠ Verification Required/)
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})

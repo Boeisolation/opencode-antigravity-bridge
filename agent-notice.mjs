@@ -15,8 +15,10 @@ const ERROR_LINE = "⚠ Agent execution terminated due to error."
 const NETWORK_LINE = "⚠ There was a network issue connecting to the server, please try again."
 const CREDITS_LINE = "⚠ Your AI credits balance is too low to continue."
 const DISABLED_LINE = "⚠ This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product."
+export const VERIFY_LINE = "⚠ Verification Required"
+export const QUOTA_HEAD = "⚠ Individual quota reached"
 const INVALID_LINE = "⚠ Model produced invalid output."
-const TERMINAL_LINES = [NETWORK_LINE, CREDITS_LINE, DISABLED_LINE]
+const TERMINAL_LINES = [NETWORK_LINE, CREDITS_LINE, DISABLED_LINE, VERIFY_LINE]
 const INTERRUPT_LINE = "⚠ The stream was interrupted. Please continue the task you were working on."
 const API_HEAD = "⚠ API error (attempt "
 const API_FULL = /^⚠ API error \(attempt \d+\): /
@@ -60,6 +62,8 @@ export class AgentNoticeFilter {
     if (complete && TERMINAL_LINES.includes(line.trimEnd())) return "terminal"
     if (!complete && TERMINAL_LINES.some(value => value.startsWith(line) ||
       (line.length <= value.length + 16 && line.trimEnd() === value))) return "hold"
+    if (complete && line.startsWith(QUOTA_HEAD)) return "terminal"
+    if (!complete && (QUOTA_HEAD.startsWith(line) || (line.startsWith(QUOTA_HEAD) && line.length <= 512))) return "hold"
     if (line.startsWith("⚠") || "⚠".startsWith(line)) {
       if (complete ? [INTERRUPT_LINE, INVALID_LINE].includes(line.trimEnd()) : false) return "notice"
       if (isApiBanner(line)) return "api"
@@ -163,7 +167,7 @@ export class AgentNoticeFilter {
     const line = rest[0] === "\n" ? rest.slice(1) : rest
     if (line.trimEnd() === ERROR_LINE) { this.failureCandidate = true; this.terminal += rest; return holdTerminal ? "" : this.flush() }
     if (!this.fence) {
-      if (TERMINAL_LINES.includes(line.trimEnd())) { this.failureCandidate = true; this.terminalDetail = line.trimEnd(); this.dropped++; return "" }
+      if (TERMINAL_LINES.includes(line.trimEnd()) || line.startsWith(QUOTA_HEAD)) { this.failureCandidate = true; this.terminalDetail = line.trimEnd(); this.dropped++; return "" }
       if (isApiBanner(line)) {
         this.apiDetail = line.slice(0, 2000)
         if (isRefused429(this.apiDetail)) this.refusedDetail = this.apiDetail
