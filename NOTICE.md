@@ -5,3 +5,5 @@ Portions of `step-usage.mjs`, `index.mjs`, `re2-pattern.mjs`, `array-items.mjs`,
 The semantic system-prompt rewrites and path-reference guidance in `cloak.mjs` also incorporate changes from magpie-community/plugins commits `5bb4194` and `00892c8`, under the same MIT license.
 
 `tool-budget.mjs`, `signin.mjs`, `install.mjs`, `opencode2.mjs`, `streamErrorOf`, the Nov 2026 `cloak.mjs` / `usage.mjs` / `ideToolOf` updates, `run_command` `toolSummary` handling, `systemAppend` opt-in, and `refuseTurn` / `RESOURCE_EXHAUSTED` notice handling incorporate patterns and adaptations from magpie-community/plugins, `packages/agy-cli` (agy-cli 0.1.55–0.1.64), under the same MIT license.
+
+Subsequent parity adaptations across `cloak.mjs`, `agent-notice.mjs`, `platform.mjs`, `documents.mjs`, `proc.mjs`, `usage.mjs`, `signin.mjs`, `model-ids.mjs`, and `index.mjs` are adapted from magpie-community/plugins, `packages/agy-cli@0.1.89` (commit `4b3af4a5659da3451d0e18286985070b7cefa18e`), under the same MIT license.

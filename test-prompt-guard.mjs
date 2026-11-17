@@ -279,3 +279,37 @@ test("Nov 14-15 client triggers (Hermes, OpenCode, Codex CLI, pi, DeepSeek Harne
   assert.equal(ideToolOf({ toolName: "ide-tools/glob" }), "glob")
   assert.equal(ideToolOf({ name: "run_command", title: "run_command" }), null)
 })
+
+test("DeepSeek Harness 0.2.2 Web GUI browser sentence cloaks provides->gives, updates DSH_HINT, and keeps near misses intact", () => {
+  const webGui = 'You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. When the user refers to "this page", "this GUI", or "this app" without naming another target, they mean this GUI. The browser provides no implicit DOM, route, or screenshot context. The client-plugin HMR receiver is active, but client-plugin changes reload without a refresh only while `pnpm run dev:web` is also running from this same checkout to rebuild their bundles; verify that watcher before promising automatic updates. Every other change — the apps/web shell and plain packages — requires rebuilding the affected Web artifacts and verifying this existing URL after a page refresh. Starting another server does not update this GUI. The apps/web Vite entry builds the shell but is not a standalone application because only dsh web injects window.__DSH_BOOT__. Do not start a replacement server unless the user asks; if one is needed, use a managed background job and verify its exact URL.'
+  const pathGuidanceText = 'Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths identify files or directories on the host. A trailing slash marks a directory: list it when its contents matter. Anything else is a file: use the read tool when its contents are needed, and do not claim to have inspected it before reading. @"..." quotes a path containing spaces.'
+  const sys = `You are an AI agent powered by DeepSeek Harness.\n\n${pathGuidanceText}\n\n${webGui}`
+
+  assert.equal(turnsAway(webGui), true)
+  const out = outgoing(sys)
+  assert.equal(
+    out,
+    `You're an AI agent powered by DeepSeek Harness.\n\n${outgoing(pathGuidanceText)}\n\n${webGui.replace("The browser provides no implicit", "The browser gives no implicit")}`,
+  )
+  assert.equal(turnsAway(out), false)
+  assert.equal(outgoing(out), out)
+
+  const obfuscated = "the browser provides\u200b no implicit\nDOM, route, or screenshot context."
+  assert.equal(turnsAway(obfuscated), true)
+  assert.equal(cloak(obfuscated), "the browser gives no implicit\nDOM, route, or screenshot context.")
+
+  assert.match(hint(webGui), /DeepSeek Harness/)
+  assert.match(hint(webGui), /The browser provides no implicit DOM, route, or screenshot context\./)
+  assert.match(hint(webGui), /The browser gives …/)
+  assert.equal(cloakUser(webGui), webGui)
+
+  for (const nearMiss of [
+    "The browser provides no implicit DOM, route, or screenshot context",
+    "The browser provides no implicit DOM, route or screenshot context.",
+    "The browser provides no DOM, route, or screenshot context.",
+    "The browser gives no implicit DOM, route, or screenshot context.",
+  ]) {
+    assert.equal(turnsAway(nearMiss), false, nearMiss)
+    assert.equal(cloak(nearMiss), nearMiss, nearMiss)
+  }
+})
